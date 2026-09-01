@@ -263,7 +263,7 @@ class CupHandle(DetectorBase):
             cup_len = int((df.index[cup_win_end] - df.index[cup_win_start]).days * 0.7)
             # 柄区：右沿之后至今，回调深度<=杯深一半且<=max_handle_depth
             handle = df.iloc[pos_rim:i]
-            if len(handle) < self.min_handle_days or len(handle) > 21:
+            if len(handle) < self.min_handle_days or len(handle) > self.max_handle_days:
                 continue
             h_low = float(handle["L"].min())
             h_depth = (H_top - h_low) / H_top
