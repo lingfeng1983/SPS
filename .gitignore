@@ -1,0 +1,44 @@
+# SPS .gitignore
+
+# Virtual environment
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+!SPS.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Temporary / scratch files
+_tmp_*.py
+_t3.pyc
+replay.json
+resp.json
+combo.json
+screen_test.json
+*.tmp
+
+# Runtime data
+data/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Hermes
+.agents/
+.claude/
+dist2/
