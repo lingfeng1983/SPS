@@ -271,7 +271,10 @@ def _ma_spread(df, p, rps=None):
 
 @indicator("amp20", "20日平均振幅 ≤ %(波动适中)", "全量因子", 5,
           desc="20日平均日振幅≤X%。振幅适中(3-4%)的票走势流畅好持有；高振幅票难拿住且止损容易被扫。",
-          valid_range=[2,12])
+          valid_range=[2,12],
+          risks=["低振幅可能是无量阴跌前的沉寂，未必是蓄势", "阈值过小会漏掉真正启动的强势票"],
+          watch_points=["振幅是否从低位开始放大（变盘前兆）", "放量时的振幅方向（向上/向下）"],
+          invalidation=["振幅连续放大且价格下行", "价格跌破箱体下沿"])
 def _amp(df, p, rps=None):
     amp = (df["H"] - df["L"]) / df["C"].shift() * 100
     return amp.rolling(20, min_periods=10).mean() <= float(p)
@@ -279,7 +282,10 @@ def _amp(df, p, rps=None):
 
 @indicator("yang_streak", "连续阳线 ≥ 天", "全量因子", 3,
           desc="连续N天收盘>开盘=买方持续主导。连续5天阳线时20日均收益+2.02%(全场最高)，但样本较少注意甄别。",
-          valid_range=[2,8])
+          valid_range=[2,8],
+          risks=["连续阳线后短线超买、获利盘增多", "连续阳线末端可能是情绪高点，次日容易回踩"],
+          watch_points=["阳线实体是否逐步收窄（动能衰减）", "连续阳线期间量能是否持续配合"],
+          invalidation=["出现阴线打破连阳", "连续阳线末端量能大幅萎缩"])
 def _yang(df, p, rps=None):
     up = df["C"] > df["O"]
     run = up.astype(int)

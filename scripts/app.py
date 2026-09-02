@@ -387,8 +387,10 @@ def _do_screen_worker(conds, stop_pct):
                         daily[sym] = df[["O","H","L","C","V"]]
             except Exception:
                 pass
-            if i % 100 == 0:
-                _screen_task["progress"] = {"phase": "加载日线文件", "pct": round(i/total_files*50)}
+            # 节流更新进度：每 50 个文件或最后一个文件时更新一次，避免 %100 稀疏导致进度条卡 0%
+            if i % 50 == 0 or i == total_files - 1:
+                pct = round((i + 1) / total_files * 50) if total_files else 50
+                _screen_task["progress"] = {"phase": "加载日线文件", "pct": pct}
         if not daily:
             _screen_task["error"] = "无日线缓存，请先运行扫描"
             return
@@ -435,26 +437,32 @@ def _do_screen_worker(conds, stop_pct):
                     {"industry": k, "count": v} for k, v in ind_cnt.most_common(30)]
         except Exception as e:
             print(f"[warn] industry summary failed: {e}")
-        watch_file = RUN_DIR / "watchpool.json"
-        prev = {}
-        if watch_file.exists():
-            try:
-                prev = json.loads(watch_file.read_text(encoding="utf-8"))
-            except Exception:
-                prev = {}
-        trig_syms = {r["symbol"] for r in out["triggered"]}
-        upgraded = []
-        for sym in trig_syms:
-            if sym in prev.get("near", {}) and sym not in prev.get("triggered", set()):
-                upgraded.append({"symbol": sym, "name": names.get(sym, ""),
-                                 "was_missing": prev["near"][sym]})
-        watch_file.write_text(json.dumps({
-            "updated": time.strftime("%Y-%m-%d %H:%M"),
-            "triggered": {r["symbol"]: r.get("met", []) for r in out["triggered"]},
-            "near": {r["symbol"]: [names.get(n, n) for n in r.get("missing", [])]
-                     for r in out["near"]}}, ensure_ascii=False), encoding="utf-8")
-        out["upgraded"] = upgraded
-        out["upgraded_from"] = prev.get("updated")
+        # 观察池升级提醒是次要副产品：写失败/并发写不应影响筛选主结果，独立 try 隔离
+        out["upgraded"] = []
+        out["upgraded_from"] = None
+        try:
+            watch_file = RUN_DIR / "watchpool.json"
+            prev = {}
+            if watch_file.exists():
+                try:
+                    prev = json.loads(watch_file.read_text(encoding="utf-8"))
+                except Exception:
+                    prev = {}
+            trig_syms = {r["symbol"] for r in out["triggered"]}
+            upgraded = []
+            for sym in trig_syms:
+                if sym in prev.get("near", {}) and sym not in prev.get("triggered", set()):
+                    upgraded.append({"symbol": sym, "name": names.get(sym, ""),
+                                     "was_missing": prev["near"][sym]})
+            watch_file.write_text(json.dumps({
+                "updated": time.strftime("%Y-%m-%d %H:%M"),
+                "triggered": {r["symbol"]: r.get("met", []) for r in out["triggered"]},
+                "near": {r["symbol"]: [names.get(n, n) for n in r.get("missing", [])]
+                         for r in out["near"]}}, ensure_ascii=False), encoding="utf-8")
+            out["upgraded"] = upgraded
+            out["upgraded_from"] = prev.get("updated")
+        except Exception as e:
+            print(f"[warn] watchpool 写入失败(不影响筛选结果): {e}")
         SCREEN_LAST["result"] = out
         _screen_task["result"] = out
         _screen_task["progress"] = {"phase": "完成", "pct": 100}
@@ -1284,8 +1292,11 @@ td.val{text-align:right;font-weight:600}
     </div>
     <button style="background:#33415580;margin-top:6px" onclick="doBacktestCombo()">🧪 ① 组合回测（先验证胜率）</button>
     <div id="comboResult" style="font-size:11.5px;color:var(--muted);margin-top:2px" role="status"></div>
-    <button class="green" style="margin-top:6px" onclick="doScreen()">🎯 ② 开始筛选</button>
-    <button style="background:#33415580;margin-top:6px" onclick="saveStrategy()">💾 保存为策略</button>
+    <div class="row" style="margin-top:8px;flex-wrap:wrap">
+      <button class="green" onclick="doScreen()">🎯 ② 开始筛选</button>
+      <button style="background:#33415580" onclick="saveStrategy()">💾 保存为策略</button>
+      <button style="background:#7f1d1d" onclick="clearAllConds()" title="取消全部已选风格与勾选指标，恢复默认参数并清空结果列表">🧹 清空重筛</button>
+    </div>
     <div style="margin-top:10px">
       <h3>📁 我的策略</h3>
       <div id="strategyList"></div>
@@ -1793,6 +1804,32 @@ function collectConds(){
       : parseFloat(inputs[0].value);
   });
   return conds;
+}
+
+// 一键清空：取消全部风格卡 + 勾选指标，参数恢复默认，并清空结果列表
+function clearAllConds(){
+  // 1. 清空已选风格（activeTpls）并重绘模板卡
+  activeTpls = [];
+  renderTemplates();
+  closeTplDetail();
+  // 2. 全部指标复选框取消勾选 + 参数恢复默认值
+  document.querySelectorAll('.indChk').forEach(c=>{
+    c.checked = false;
+    c.dispatchEvent(new Event('change',{bubbles:true}));   // 触发禁用参数/清预览联动
+  });
+  const byName = {};
+  INDS.forEach(i=>{ byName[i.name]=i.default; });
+  document.querySelectorAll('.indP').forEach(x=>{
+    const def = byName[x.dataset.ind];
+    if(def===undefined) return;
+    x.value = Array.isArray(def) ? def[x.dataset.idx|0] : def;
+  });
+  // 3. 清空结果列表与预览
+  SCREEN_RESULT = null;
+  indFilter = null;
+  const listEl = document.getElementById('list');
+  if(listEl) listEl.innerHTML =
+    '<div style="color:var(--muted);text-align:center;padding:40px">已清空。请选择风格或勾选指标后重新筛选。</div>';
 }
 
 window.addEventListener('error', e => {
