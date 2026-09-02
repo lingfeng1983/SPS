@@ -42,8 +42,10 @@ D:\SPS
 │   ├── run_scan.py                   # 命令行扫描器
 │   └── build_report.py               # HTML 报告生成
 ├── tests/
-│   ├── test_patterns.py              # 形态合成 K 线正例/反例 + 无泄漏测试
-│   └── test_screener.py              # 筛选器单元测试
+│   ├── test_patterns.py              # 形态合成 K 线（W底/平台）+ 无泄漏测试
+│   ├── test_patterns_extra.py        # 形态合成 K 线（杯柄/口袋支点）
+│   ├── test_screener.py              # 筛选器单元测试
+│   └── test_positions.py             # 持仓管理与卖出规则回测
 ├── data/                             # 运行时数据（git ignored）
 │   ├── daily/                        # 日线缓存（~5700 parquet）
 │   ├── meta/                         # 股票列表/行业映射/指数
@@ -102,7 +104,7 @@ cd D:\SPS
 - [x] PyInstaller 一键打包（~171MB onedir）
 
 ### 工程化
-- [x] pytest 12/12 通过
+- [x] pytest 24/24 通过
 - [x] git 版本控制
 - [x] 依赖锁定（`requirements.txt`）
 - [x] `.gitignore` 清理
@@ -131,9 +133,8 @@ cd D:\SPS
 - [x] V1.1：PyInstaller 桌面打包 + 用户文档
 
 ### 待做
-- [ ] 形态引擎：补齐 VCP、头肩底等剩余形态（研究向）
+- [ ] 形态引擎：补齐 VCP、头肩底等剩余形态（研究向，范围外）
 - [ ] 分层统计：bootstrap 置信区间 / 聚类去相关（方法论）
-- [ ] 测试：`CUP_HANDLE`/`POCKET_PIVOT` 合成 K 线正例/反例
 - [ ] 基本面漏斗：PE/ROE/营收增速作为第一关过滤
 
 ---

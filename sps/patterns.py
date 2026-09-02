@@ -65,7 +65,6 @@ class WBottom(DetectorBase):
         # ATR 唯一入口：禁止内联重算（规格书 0.5 节纪律）
         atr = wilder_atr_series(df, n=14)
         events = []
-        lows_all = pv.pv[pv.pv["kind"] == "low"]
         n = len(df)
         # 遍历确认候选日：从第2个低点可用后开始
         # min_gap_days=两底最小间隔, k=Pivot延迟, 5=第二底构筑最小窗口
@@ -228,7 +227,6 @@ class CupHandle(DetectorBase):
         atr = wilder_atr_series(df)
         n = len(df)
         events = []
-        highs_all = pv.pv[pv.pv["kind"] == "high"]
         for i in range(self.min_cup_days + 2 * k + self.min_lookback, n):
             t = df.index[i]
             vis = pv.as_of(t)
