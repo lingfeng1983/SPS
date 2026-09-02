@@ -75,15 +75,19 @@ def run(symbols: list[str], start: str = "20190101",
         kind_map: dict[str, str] | None = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     events_all, stat_rows = [], []
+    total = len(symbols)
 
     # 基准与 RPS 表（供环境评分用）
     idx = get_index("000300", start="20180101")
     regime = market_regime(idx["C"])
 
-    print(f"scanning {len(symbols)} symbols ...")
+    print(f"scanning {total} symbols ...")
+    print(f"[progress] 0/{total}")
     cache = {}
     fund_filtered = 0
-    for sym in symbols:
+    for i, sym in enumerate(symbols):
+        if i > 0 and i % 20 == 0:
+            print(f"[progress] {i}/{total}")
         kind = (kind_map or {}).get(sym, "stock")
         # ---- 第一关：基本面红线（仅股票；ETF无财务报表）----
         if kind == "stock":

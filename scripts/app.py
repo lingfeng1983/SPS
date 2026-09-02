@@ -37,7 +37,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------- 后台任务管理
 
 _job = {"running": False, "log": [], "done": False, "cmd": None,
-        "proc": None}
+        "proc": None, "progress": None}
 
 
 def stop_job() -> bool:
@@ -1121,8 +1121,20 @@ def api_stop():
 
 @app.route("/api/job")
 def api_job():
+    progress = None
+    if _job["log"]:
+        for line in reversed(_job["log"][-20:]):
+            if "[progress]" in line:
+                try:
+                    parts = line.split("[progress]")[-1].strip().split("/")
+                    cur, tot = int(parts[0]), int(parts[1])
+                    progress = {"current": cur, "total": tot, "pct": round(cur/tot*100) if tot else 0}
+                except (ValueError, IndexError):
+                    pass
+                break
     return jsonify({"running": _job["running"], "done": _job["done"],
-                    "log": _job["log"][-40:], "total_lines": len(_job["log"])})
+                    "log": _job["log"][-40:], "total_lines": len(_job["log"]),
+                    "progress": progress})
 
 
 @app.route("/detail/<symbol>")
@@ -1256,6 +1268,12 @@ td.val{text-align:right;font-weight:600}
 <div id="main">
   <div id="freshBar" style="display:flex;gap:10px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:10px;padding:7px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px">
     <span class="dot" id="freshDot"></span><span id="freshText">检查数据新鲜度…</span>
+    <div id="freshProgress" style="display:none;flex:1;margin-left:8px;max-width:200px">
+      <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden">
+        <div id="freshProgressBar" style="height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width 0.3s"></div>
+      </div>
+      <div id="freshProgressText" style="font-size:10.5px;margin-top:2px;color:var(--muted)"></div>
+    </div>
     <button onclick="runScanData()" id="freshBtn" style="width:auto;padding:3px 10px;margin:0;font-size:11px;background:#33415580">⬇ 更新数据</button>
     <button onclick="openAISettings()" style="width:auto;padding:3px 10px;margin:0;margin-left:auto;font-size:11px;background:#33415580">⚙ AI 设置</button>
   </div>
@@ -1333,9 +1351,18 @@ function pollJobFresh(){
     try{
       const j=await (await fetch('/api/job')).json();
       if(!j.running){ clearInterval(_freshPoll); _freshPoll=null; checkFresh(); return; }
-      setFresh('running',`更新数据中… ${j.progress||''}`);
+      const prog=j.progress;
+      if(prog && prog.total>10){
+        document.getElementById('freshProgress').style.display='';
+        document.getElementById('freshProgressBar').style.width=prog.pct+'%';
+        document.getElementById('freshProgressText').textContent=`${prog.current}/${prog.total} (${prog.pct}%)`;
+        setFresh('running',`更新数据中…`);
+      } else {
+        document.getElementById('freshProgress').style.display='none';
+        setFresh('running','更新数据中…');
+      }
     }catch(e){}
-  },4000);
+  },2000);
 }
 
 // ================= 策略模板卡片（P0） =================
@@ -1837,7 +1864,13 @@ async function doScreen(){
   const conds = collectConds();
   if (!Object.keys(conds).length){ alert('请先选一个风格或勾选指标'); return; }
   const listEl = document.getElementById('list');
-  listEl.innerHTML = '<div style="color:var(--muted);padding:30px;text-align:center">筛选中，全市场计算指标…</div>';
+  listEl.innerHTML = `<div style="padding:30px;text-align:center">
+    <div style="color:var(--muted);margin-bottom:12px">筛选中，全市场计算指标…</div>
+    <div style="width:200px;height:6px;background:#1e293b;border-radius:3px;margin:0:auto;overflow:hidden">
+      <div style="height:100%;width:30%;background:var(--accent);border-radius:3px;animation:progPulse 1.2s ease-in-out infinite"></div>
+    </div>
+    <style>@keyframes progPulse{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}</style>
+  </div>`;
   const r = await fetch('/api/screen', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({conditions: conds,
