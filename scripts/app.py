@@ -874,8 +874,16 @@ function renderTrade(t, j){
 function renderConds(list){
   document.getElementById('sigtab').innerHTML=list.map(c=>{
     const cls=c.ok?'ok':'no';
+    const risks=(c.risks||[]).map(r=>`<li>${r}</li>`).join('');
+    const watch=(c.watch_points||[]).map(w=>`<li>${w}</li>`).join('');
+    const invalid=(c.invalidation||[]).map(i=>`<li>${i}</li>`).join('');
     return `<tr><td class="lbl"><span class="${cls}">${c.ok?'✓':'✗'}</span> ${c.label}</td>
-      <td class="val ${cls}">${c.ok?'满足':'未满足'}</td></tr>`;
+      <td class="val ${cls}">${c.ok?'满足':'未满足'}</td>
+      <td style="padding:0 8px;vertical-align:top;max-width:320px">
+        ${risks?`<div style="font-size:10.5px;color:#fca5a5">⚠ 风险</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${risks}</ul>`:''}
+        ${watch?`<div style="font-size:10.5px;color:#fbbf24">👁 观察</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${watch}</ul>`:''}
+        ${invalid?`<div style="font-size:10.5px;color:#22c55e">✖ 失效</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${invalid}</ul>`:''}
+      </td></tr>`;
   }).join('')||'<tr><td class="lbl na">无条件信息</td></tr>';
 }
 
@@ -944,7 +952,10 @@ def api_screen_detail(symbol: str):
             ok = bool(series.iloc[-1]) if series is not None and len(series) else False
         except Exception:
             ok = False
-        cond_status.append({"name": name, "label": meta["label"], "ok": ok})
+        cond_status.append({"name": name, "label": meta["label"], "ok": ok,
+                            "risks": meta.get("risks", []),
+                            "watch_points": meta.get("watch_points", []),
+                            "invalidation": meta.get("invalidation", [])})
 
     pos = len(df) - 1
     trade = entry_and_stop(df, pos, stop_pct=stop_pct) or {}
@@ -1630,10 +1641,16 @@ function renderIndPreview(){
   const html = `<div id="${boxId}" style="margin-bottom:12px">` +
     checked.map(n => {
       const ind = INDS.find(x=>x.name===n); if(!ind) return '';
+      const risks = (ind.risks||[]).map(r=>`<li>${r}</li>`).join('');
+      const watch = (ind.watch_points||[]).map(w=>`<li>${w}</li>`).join('');
+      const invalid = (ind.invalidation||[]).map(i=>`<li>${i}</li>`).join('');
       return `<div class="card" style="border-left:3px solid var(--accent)">
         <div style="font-weight:700;font-size:13px;margin-bottom:4px">${ind.label}
           <span style="color:var(--muted);font-weight:400;font-size:11.5px">(默认 ${Array.isArray(ind.default)?ind.default.join('~'):ind.default})</span></div>
         <div style="font-size:12.5px;line-height:1.65;color:var(--muted)">${ind.desc||''}</div>
+        ${risks?`<div style="margin-top:6px"><div style="font-size:11.5px;font-weight:600;color:#fca5a5">⚠ 风险</div><ul style="margin:2px 0 0 16px;font-size:11.5px;color:var(--muted)">${risks}</ul></div>`:''}
+        ${watch?`<div style="margin-top:4px"><div style="font-size:11.5px;font-weight:600;color:#fbbf24">👁 观察</div><ul style="margin:2px 0 0 16px;font-size:11.5px;color:var(--muted)">${watch}</ul></div>`:''}
+        ${invalid?`<div style="margin-top:4px"><div style="font-size:11.5px;font-weight:600;color:#22c55e">✖ 失效</div><ul style="margin:2px 0 0 16px;font-size:11.5px;color:var(--muted)">${invalid}</ul></div>`:''}
       </div>`;
     }).join('') + '</div>';
   if(box){ box.outerHTML = html; }
@@ -2013,8 +2030,16 @@ function renderDetailBody(j){
   }).join('');
   document.getElementById('sigtab2').innerHTML=(j.cond_status||[]).map(c=>{
     const cls=c.ok?'ok':'no';
+    const risks=(c.risks||[]).map(r=>`<li>${r}</li>`).join('');
+    const watch=(c.watch_points||[]).map(w=>`<li>${w}</li>`).join('');
+    const invalid=(c.invalidation||[]).map(i=>`<li>${i}</li>`).join('');
     return `<tr><td class="lbl"><span class="${cls}">${c.ok?'✓':'✗'}</span> ${c.label}</td>
-      <td class="val ${cls}">${c.ok?'满足':'未满足'}</td></tr>`;
+      <td class="val ${cls}">${c.ok?'满足':'未满足'}</td>
+      <td style="padding:0 8px;vertical-align:top;max-width:320px">
+        ${risks?`<div style="font-size:10.5px;color:#fca5a5">⚠ 风险</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${risks}</ul>`:''}
+        ${watch?`<div style="font-size:10.5px;color:#fbbf24">👁 观察</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${watch}</ul>`:''}
+        ${invalid?`<div style="font-size:10.5px;color:#22c55e">✖ 失效</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${invalid}</ul>`:''}
+      </td></tr>`;
   }).join('')||'<tr><td class="lbl">无条件信息</td></tr>';
   const hist=j.history||[];
   const hEl=document.getElementById('histtab');
