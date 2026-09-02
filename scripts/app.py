@@ -1059,7 +1059,7 @@ def api_screen_detail(symbol: str):
             if d in [str(x)[:10] for x in df.index]:
                 row = df.loc[:d]
                 lo = float(row["L"].iloc[-1])
-                color = "#22c55e" if h["fwd20"] >= 0 else "#ef4444"
+                color = "#ef4444" if h["fwd20"] >= 0 else "#22c55e"
                 lay["annotations"].append({
                     "x": d, "y": lo * 0.97,
                     "xref": "x", "yref": "y", "showarrow": True,
