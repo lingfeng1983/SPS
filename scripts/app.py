@@ -38,7 +38,8 @@ app = Flask(__name__)
 
 _job = {"running": False, "log": [], "done": False, "cmd": None,
         "proc": None, "progress": None}
-_screen_task = {"active": False, "done": False, "progress": None, "result": None, "error": None}
+_scan_progress = {"current": 0, "total": 0}
+_screen_task = {"active": False, "done": False, "progress": {"phase": "准备中", "pct": 2}, "result": None, "error": None}
 
 
 def stop_job() -> bool:
@@ -796,10 +797,14 @@ td.lbl{color:var(--muted)}td.val{text-align:right;font-weight:600}
 .health{font-size:14px;font-weight:700}
 .ok{color:var(--green)}.no{color:var(--red)}.na{color:var(--muted)}
 .legend{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.7}
-.buybox{display:grid;grid-template-columns:1fr 1fr 1fr;gap:9px;margin-top:4px}
-.bk{background:#0b1120;border:1px solid var(--border);border-radius:10px;padding:10px;text-align:center}
-.bk .t{font-size:11px;color:var(--muted)}.bk .v{font-size:17px;font-weight:800;margin-top:3px}
-.v-buy{color:var(--accent)}.v-stop{color:var(--red)}
+.buybox{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
+.bk{background:linear-gradient(180deg,#111a2e 0%,#0b1120 100%);border:1px solid var(--border);border-radius:12px;padding:14px 10px;text-align:center;position:relative;overflow:hidden}
+.bk::before{content:'';position:absolute;inset:0;opacity:.06;background:radial-gradient(circle at 50% 0%,currentColor 0%,transparent 70%)}
+.bk .t{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.3px;text-transform:uppercase;position:relative}
+.bk .v{font-size:18px;font-weight:800;margin-top:6px;position:relative}
+.bk .sub{font-size:10px;color:var(--muted);margin-top:2px;font-weight:400;position:relative}
+.v-buy{color:var(--red)}.v-stop{color:var(--green)}.v-key{color:var(--accent)}
+@keyframes progPulse{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}
 </style>
 </head>
 <body>
@@ -942,7 +947,7 @@ function renderHist(hist){
     hist.slice().reverse().map(h=>`
       <tr><td class="lbl">${h.date}</td>
         <td class="val">买点 ${h.entry}</td>
-        <td class="val" style="color:${h.fwd20>=0?'var(--green)':'var(--red)'}">${h.fwd20>0?'+':''}${h.fwd20}%</td></tr>`).join('');
+        <td class="val" style="color:${h.fwd20>=0?'var(--red)':'var(--green)'}">${h.fwd20>0?'+':''}${h.fwd20}%</td></tr>`).join('');
 }
 
 load();
@@ -1315,9 +1320,9 @@ td.val{text-align:right;font-weight:600}
 <div id="main">
   <div id="freshBar" style="display:flex;gap:10px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:10px;padding:7px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px">
     <span class="dot" id="freshDot"></span><span id="freshText">检查数据新鲜度…</span>
-    <div id="freshProgress" style="display:none;flex:1;margin-left:8px;max-width:200px">
+    <div id="freshProgress" style="flex:1;margin-left:8px;max-width:200px">
       <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden">
-        <div id="freshProgressBar" style="height:100%;width:0%;background:var(--accent);border-radius:3px;transition:width 0.3s"></div>
+        <div id="freshProgressBar" style="height:100%;width:5%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:3px;transition:width 0.3s"></div>
       </div>
       <div id="freshProgressText" style="font-size:10.5px;margin-top:2px;color:var(--muted)"></div>
     </div>
@@ -1398,18 +1403,21 @@ function pollJobFresh(){
     try{
       const j=await (await fetch('/api/job')).json();
       if(!j.running){ clearInterval(_freshPoll); _freshPoll=null; checkFresh(); return; }
+      const bar=document.getElementById('freshProgressBar');
+      const txt=document.getElementById('freshProgressText');
       const prog=j.progress;
-      if(prog && prog.total>10){
-        document.getElementById('freshProgress').style.display='';
-        document.getElementById('freshProgressBar').style.width=prog.pct+'%';
-        document.getElementById('freshProgressText').textContent=`${prog.current}/${prog.total} (${prog.pct}%)`;
-        setFresh('running',`更新数据中…`);
+      if(prog && prog.total>0){
+        bar.style.width=prog.pct+'%';
+        bar.style.animation='';
+        if(txt) txt.textContent=`${prog.current}/${prog.total} (${prog.pct}%)`;
       } else {
-        document.getElementById('freshProgress').style.display='none';
-        setFresh('running','更新数据中…');
+        bar.style.width='30%';
+        bar.style.animation='progPulse 1.4s ease-in-out infinite';
+        if(txt) txt.textContent='更新数据中…';
       }
+      setFresh('running',`更新数据中…`);
     }catch(e){}
-  },2000);
+  },1000);
 }
 
 // ================= 策略模板卡片（P0） =================
@@ -1940,7 +1948,7 @@ async function doScreen(){
   const prog = `<div id="screenProg" style="padding:30px;text-align:center">
     <div style="color:var(--muted);margin-bottom:12px" id="screenProgText">筛选中，全市场计算指标…</div>
     <div style="width:240px;height:8px;background:#1e293b;border-radius:4px;margin:0 auto;overflow:hidden">
-      <div id="screenProgBar" style="height:100%;width:0%;background:var(--accent);border-radius:4px;transition:width 0.3s"></div>
+      <div id="screenProgBar" style="height:100%;width:5%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:4px;transition:width 0.3s"></div>
     </div>
     <div id="screenProgPct" style="font-size:11px;margin-top:6px;color:var(--muted)"></div>
   </div>`;
@@ -2055,9 +2063,21 @@ function renderDetail(sym, j){
         <div class="card">
           <h4>💰 买卖点与止损</h4>
           <div class="buybox">
-            <div class="bk"><div class="t">买点(次日开盘)</div><div class="v v-buy" id="bp2">-</div></div>
-            <div class="bk"><div class="t">止损位</div><div class="v v-stop" id="sp2">-</div></div>
-            <div class="bk"><div class="t">关键位(监控)</div><div class="v" id="kl2">-</div></div>
+            <div class="bk" style="color:var(--red)">
+              <div class="t">买点(次日开盘)</div>
+              <div class="v v-buy" id="bp2">-</div>
+              <div class="sub" id="bp2sub">信号日+1</div>
+            </div>
+            <div class="bk" style="color:var(--green)">
+              <div class="t">止损位</div>
+              <div class="v v-stop" id="sp2">-</div>
+              <div class="sub" id="sp2sub">收盘跌破即卖</div>
+            </div>
+            <div class="bk" style="color:var(--accent)">
+              <div class="t">MA20关键位</div>
+              <div class="v v-key" id="kl2">-</div>
+              <div class="sub">趋势生命线</div>
+            </div>
           </div>
         </div>
       </div>
@@ -2143,14 +2163,12 @@ function renderDetailBody(j){
   const t=j.trade||{}, kl=j.key_levels||{}, fu=j.fundamental||{};
   document.getElementById('bp2').textContent=t.entry_price??'-';
   document.getElementById('sp2').textContent=t.stop_price??'-';
-  const klItems=[
-    kl.ma20!=null&&['MA20均线',kl.ma20,'跌破则趋势转弱'],
-    kl.stop_price!=null&&['止损位',kl.stop_price,'收盘跌破无条件卖出'],
-    kl.entry_price!=null&&['买点(参考)',kl.entry_price,'次日开盘附近挂单'],
-  ].filter(Boolean);
-  document.getElementById('kl2').innerHTML = klItems.length
-    ? klItems.map(x=>`<div style="font-size:10.5px;color:var(--muted);font-weight:400" title="${x[2]}">${x[0]}</div><div style="font-size:13.5px">${x[1]}</div>`).join('')
-    : '-';
+  const bp2sub=document.getElementById('bp2sub');
+  const sp2sub=document.getElementById('sp2sub');
+  if(bp2sub) bp2sub.textContent = t.entry_date ? `进场: ${t.entry_date}` : '信号日+1开盘';
+  if(sp2sub) sp2sub.textContent = t.stop_pct ? `止损: -${t.stop_pct}%` : '收盘跌破即卖';
+  const kl2=document.getElementById('kl2');
+  if(kl2) kl2.textContent = kl.ma20!=null ? kl.ma20 : (kl.entry_price??'-');
   const checks=[
     {k:'净利润同比',v:fu.profit_yoy,ok:v=>v>0,need:'>0'},
     {k:'营收同比',v:fu.revenue_yoy,ok:v=>v>0,need:'>0'},
@@ -2188,7 +2206,7 @@ function renderDetailBody(j){
     <tr style="color:var(--muted);font-size:11px"><td class="lbl">信号日</td><td class="val">次日开盘买入价</td><td class="val">持有20日收益</td></tr>`+
       hist.slice().reverse().map(h=>`
         <tr><td class="lbl">${h.date}</td><td class="val">${h.entry}</td>
-        <td class="val" style="color:${h.fwd20>=0?'var(--green)':'var(--red)'}">${h.fwd20>0?'+':''}${h.fwd20}%</td></tr>`).join('');
+        <td class="val" style="color:${h.fwd20>=0?'var(--red)':'var(--green)'}">${h.fwd20>0?'+':''}${h.fwd20}%</td></tr>`).join('');
   } else {
     hEl.innerHTML='<tr><td class="lbl" style="color:var(--muted)">当前条件下该股历史无信号</td></tr>';
   }
