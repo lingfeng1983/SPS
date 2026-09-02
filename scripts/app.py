@@ -797,12 +797,12 @@ td.lbl{color:var(--muted)}td.val{text-align:right;font-weight:600}
 .health{font-size:14px;font-weight:700}
 .ok{color:var(--green)}.no{color:var(--red)}.na{color:var(--muted)}
 .legend{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.7}
-.buybox{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:6px}
-.bk{background:linear-gradient(180deg,#111a2e 0%,#0b1120 100%);border:1px solid var(--border);border-radius:12px;padding:14px 10px;text-align:center;position:relative;overflow:hidden}
-.bk::before{content:'';position:absolute;inset:0;opacity:.06;background:radial-gradient(circle at 50% 0%,currentColor 0%,transparent 70%)}
-.bk .t{font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.3px;text-transform:uppercase;position:relative}
-.bk .v{font-size:18px;font-weight:800;margin-top:6px;position:relative}
-.bk .sub{font-size:10px;color:var(--muted);margin-top:2px;font-weight:400;position:relative}
+.buybox{display:flex;flex-direction:column;gap:6px;margin-top:6px}
+.bk{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:linear-gradient(180deg,#111a2e 0%,#0b1120 100%);position:relative;overflow:hidden}
+.bk::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:currentColor;opacity:.5}
+.bk .t{font-size:12px;color:var(--muted);font-weight:600;flex:1}
+.bk .v{font-size:16px;font-weight:800}
+.bk .sub{font-size:10px;color:var(--muted);font-weight:400}
 .v-buy{color:var(--red)}.v-stop{color:var(--green)}.v-key{color:var(--accent)}
 @keyframes progPulse{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}
 </style>
