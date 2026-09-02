@@ -38,6 +38,7 @@ app = Flask(__name__)
 
 _job = {"running": False, "log": [], "done": False, "cmd": None,
         "proc": None, "progress": None}
+_screen_task = {"active": False, "done": False, "progress": None, "result": None, "error": None}
 
 
 def stop_job() -> bool:
@@ -345,9 +346,9 @@ SCREEN_LAST = {"result": None}   # 最近一次筛选结果（AI 解读用）
 
 @app.route("/api/screen", methods=["POST"])
 def api_screen():
-    """执行参数化筛选。body: {conditions:{name:param}, stop_pct:7}"""
-    import pandas as pd
-    from sps.screener import screen, entry_and_stop, INDICATORS, validate_conditions
+    """启动筛选任务（后台运行，通过 /api/screen_status 查询进度）。"""
+    if _screen_task["active"]:
+        return jsonify({"error": "已有筛选任务在运行中"}), 409
     body = request.get_json(force=True) or {}
     raw_conds = {k: v for k, v in (body.get("conditions") or {}).items()
                  if k in INDICATORS}
@@ -357,91 +358,126 @@ def api_screen():
     if not conds:
         return jsonify({"error": "未选择任何条件"}), 400
     stop_pct = float(body.get("stop_pct", 7.0))
-    # 载入全部已缓存日线
-    daily = {}
-    for f in DATA_DIR.glob("daily/*.parquet"):
-        sym = f.stem.split("_")[0]
-        try:
-            df = pd.read_parquet(f)
-            if isinstance(df.index, pd.DatetimeIndex) and {"O","H","L","C","V"} <= set(df.columns):
-                daily[sym] = df
-            elif "date" in df.columns:
-                df = df.set_index(pd.to_datetime(df["date"]))
-                if {"O","H","L","C","V"} <= set(df.columns):
-                    daily[sym] = df[["O","H","L","C","V"]]
-        except Exception:
-            continue
-    if not daily:
-        return jsonify({"error": "无日线缓存，请先运行扫描"}), 400
-    wide = pd.DataFrame({s: d["C"] for s, d in daily.items()})
-    out = screen(daily, wide, conds)
-    names = symbol_names()
-    # 所有触发标的先补名称（修 bug：之前只给前80只填名称，其余空白）
-    for rec in out["triggered"] + out["near"]:
-        rec["_name"] = names.get(rec["symbol"], "")
-    # 给触发的标的算买点/止损；标记是否有K线缓存（详情页可用）
-    for rec in out["triggered"][:80]:
-        df = daily.get(rec["symbol"])
-        if df is None:
-            continue
-        pos = len(df) - 1
-        rec.update(entry_and_stop(df, pos, stop_pct=stop_pct) or {})
-        rec["has_kline"] = True
-    # near 只保留有K线的（可查看详情才有意义）
-    near_keep = []
-    for rec in out["near"]:
-        rec["_name"] = names.get(rec["symbol"], "")
-        if rec["symbol"] in daily:
-            rec["has_kline"] = True
-            near_keep.append(rec)
-    out["near"] = near_keep
-    out["scanned"] = len(daily)
-    # 行业聚合：结果按行业统计 + 行业RPS（行业内RPS中位数）
+    _screen_task["active"] = True
+    _screen_task["done"] = False
+    _screen_task["progress"] = {"phase": "准备中", "pct": 0}
+    _screen_task["result"] = None
+    _screen_task["error"] = None
+    threading.Thread(target=_do_screen_worker, args=(conds, stop_pct), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+def _do_screen_worker(conds, stop_pct):
     try:
-        from sps.industry import get_industry_map
-        ind_map = get_industry_map()
-        if ind_map:
-            from collections import Counter
-            for grp in ("triggered", "near"):
-                for r in out[grp]:
-                    # 未覆盖的票按代码段细分：60=沪主板 00=深主板 30=创业板 68=科创板
-                    sym = r["symbol"]
-                    if sym in ind_map:
-                        r["industry"] = ind_map[sym]
-                    else:
-                        prefix = "沪主板(未分类)" if sym.startswith("6") else \
-                                 "创业板(未分类)" if sym.startswith("3") else \
-                                 "科创板(未分类)" if sym.startswith("68") else \
-                                 "深主板(未分类)"
-                        r["industry"] = prefix
-            ind_cnt = Counter(r["industry"] for r in out["triggered"])
-            out["industry_summary"] = [
-                {"industry": k, "count": v} for k, v in ind_cnt.most_common(30)]
-    except Exception as e:  # noqa: BLE001
-        print(f"[warn] industry summary failed: {e}")
-    # 观察池升级提醒：与上次筛选相比，"接近"→"已触发"的标的
-    watch_file = RUN_DIR / "watchpool.json"
-    prev = {}
-    if watch_file.exists():
+        import pandas as pd
+        from sps.screener import screen, entry_and_stop, INDICATORS
+        _screen_task["progress"] = {"phase": "加载日线文件", "pct": 0}
+        daily = {}
+        files = list(DATA_DIR.glob("daily/*.parquet"))
+        total_files = len(files)
+        for i, f in enumerate(files):
+            sym = f.stem.split("_")[0]
+            try:
+                df = pd.read_parquet(f)
+                if isinstance(df.index, pd.DatetimeIndex) and {"O","H","L","C","V"} <= set(df.columns):
+                    daily[sym] = df
+                elif "date" in df.columns:
+                    df = df.set_index(pd.to_datetime(df["date"]))
+                    if {"O","H","L","C","V"} <= set(df.columns):
+                        daily[sym] = df[["O","H","L","C","V"]]
+            except Exception:
+                pass
+            if i % 100 == 0:
+                _screen_task["progress"] = {"phase": "加载日线文件", "pct": round(i/total_files*50)}
+        if not daily:
+            _screen_task["error"] = "无日线缓存，请先运行扫描"
+            return
+        _screen_task["progress"] = {"phase": "计算指标", "pct": 50}
+        wide = pd.DataFrame({s: d["C"] for s, d in daily.items()})
+        _screen_task["progress"] = {"phase": "计算指标", "pct": 75}
+        out = screen(daily, wide, conds)
+        _screen_task["progress"] = {"phase": "整理结果", "pct": 90}
+        names = symbol_names()
+        for rec in out["triggered"] + out["near"]:
+            rec["_name"] = names.get(rec["symbol"], "")
+        for rec in out["triggered"][:80]:
+            df = daily.get(rec["symbol"])
+            if df is None:
+                continue
+            pos = len(df) - 1
+            rec.update(entry_and_stop(df, pos, stop_pct=stop_pct) or {})
+            rec["has_kline"] = True
+        near_keep = []
+        for rec in out["near"]:
+            rec["_name"] = names.get(rec["symbol"], "")
+            if rec["symbol"] in daily:
+                rec["has_kline"] = True
+                near_keep.append(rec)
+        out["near"] = near_keep
+        out["scanned"] = len(daily)
         try:
-            prev = json.loads(watch_file.read_text(encoding="utf-8"))
-        except Exception:
-            prev = {}
-    trig_syms = {r["symbol"] for r in out["triggered"]}
-    upgraded = []
-    for sym in trig_syms:
-        if sym in prev.get("near", {}) and sym not in prev.get("triggered", set()):
-            upgraded.append({"symbol": sym, "name": names.get(sym, ""),
-                             "was_missing": prev["near"][sym]})
-    watch_file.write_text(json.dumps({
-        "updated": time.strftime("%Y-%m-%d %H:%M"),
-        "triggered": {r["symbol"]: r.get("met", []) for r in out["triggered"]},
-        "near": {r["symbol"]: [names.get(n, n) for n in r.get("missing", [])]
-                 for r in out["near"]}}, ensure_ascii=False), encoding="utf-8")
-    out["upgraded"] = upgraded
-    out["upgraded_from"] = prev.get("updated")
-    SCREEN_LAST["result"] = out   # 供 AI 解读使用
-    return jsonify(out)
+            from sps.industry import get_industry_map
+            ind_map = get_industry_map()
+            if ind_map:
+                from collections import Counter
+                for grp in ("triggered", "near"):
+                    for r in out[grp]:
+                        sym = r["symbol"]
+                        if sym in ind_map:
+                            r["industry"] = ind_map[sym]
+                        else:
+                            r["industry"] = "沪主板(未分类)" if sym.startswith("6") else \
+                                            "创业板(未分类)" if sym.startswith("3") else \
+                                            "科创板(未分类)" if sym.startswith("68") else \
+                                            "深主板(未分类)"
+                ind_cnt = Counter(r["industry"] for r in out["triggered"])
+                out["industry_summary"] = [
+                    {"industry": k, "count": v} for k, v in ind_cnt.most_common(30)]
+        except Exception as e:
+            print(f"[warn] industry summary failed: {e}")
+        watch_file = RUN_DIR / "watchpool.json"
+        prev = {}
+        if watch_file.exists():
+            try:
+                prev = json.loads(watch_file.read_text(encoding="utf-8"))
+            except Exception:
+                prev = {}
+        trig_syms = {r["symbol"] for r in out["triggered"]}
+        upgraded = []
+        for sym in trig_syms:
+            if sym in prev.get("near", {}) and sym not in prev.get("triggered", set()):
+                upgraded.append({"symbol": sym, "name": names.get(sym, ""),
+                                 "was_missing": prev["near"][sym]})
+        watch_file.write_text(json.dumps({
+            "updated": time.strftime("%Y-%m-%d %H:%M"),
+            "triggered": {r["symbol"]: r.get("met", []) for r in out["triggered"]},
+            "near": {r["symbol"]: [names.get(n, n) for n in r.get("missing", [])]
+                     for r in out["near"]}}, ensure_ascii=False), encoding="utf-8")
+        out["upgraded"] = upgraded
+        out["upgraded_from"] = prev.get("updated")
+        SCREEN_LAST["result"] = out
+        _screen_task["result"] = out
+        _screen_task["progress"] = {"phase": "完成", "pct": 100}
+    except Exception as e:
+        _screen_task["error"] = str(e)
+    finally:
+        _screen_task["active"] = False
+        _screen_task["done"] = True
+
+
+@app.route("/api/screen_status")
+def api_screen_status():
+    return jsonify({
+        "active": _screen_task["active"],
+        "done": _screen_task["done"],
+        "progress": _screen_task["progress"],
+        "error": _screen_task["error"]})
+
+@app.route("/api/screen_result")
+def api_screen_result():
+    if _screen_task["result"] is None:
+        return jsonify({"error": "无结果"}), 404
+    return jsonify(_screen_task["result"])
 
 
 # ---------------------------------------------------------------- 持仓管理（卖出侧）
@@ -1864,22 +1900,53 @@ async function doScreen(){
   const conds = collectConds();
   if (!Object.keys(conds).length){ alert('请先选一个风格或勾选指标'); return; }
   const listEl = document.getElementById('list');
-  listEl.innerHTML = `<div style="padding:30px;text-align:center">
-    <div style="color:var(--muted);margin-bottom:12px">筛选中，全市场计算指标…</div>
-    <div style="width:200px;height:6px;background:#1e293b;border-radius:3px;margin:0:auto;overflow:hidden">
-      <div style="height:100%;width:30%;background:var(--accent);border-radius:3px;animation:progPulse 1.2s ease-in-out infinite"></div>
+  const prog = `<div id="screenProg" style="padding:30px;text-align:center">
+    <div style="color:var(--muted);margin-bottom:12px" id="screenProgText">筛选中，全市场计算指标…</div>
+    <div style="width:240px;height:8px;background:#1e293b;border-radius:4px;margin:0 auto;overflow:hidden">
+      <div id="screenProgBar" style="height:100%;width:0%;background:var(--accent);border-radius:4px;transition:width 0.3s"></div>
     </div>
-    <style>@keyframes progPulse{0%{transform:translateX(-100%)}100%{transform:translateX(400%)}}</style>
+    <div id="screenProgPct" style="font-size:11px;margin-top:6px;color:var(--muted)"></div>
   </div>`;
-  const r = await fetch('/api/screen', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({conditions: conds,
-                          stop_pct: getStopPct()})});
-  if(!r.ok){
-    const e=await r.json().catch(()=>({}));
-    listEl.innerHTML=`<div style="color:var(--red);padding:20px">${e.error||'筛选失败'}</div>`;return;}
-  SCREEN_RESULT = await r.json();
-  renderScreenResult();
+  listEl.innerHTML = prog;
+  try {
+    const r = await fetch('/api/screen', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({conditions: conds, stop_pct: getStopPct()})});
+    if(r.status === 409){ alert('已有筛选任务在运行中'); return; }
+    if(!r.ok){ const e=await r.json().catch(()=>({})); listEl.innerHTML=`<div style="color:var(--red);padding:20px">${e.error||'筛选失败'}</div>`; return; }
+  } catch(e){
+    listEl.innerHTML=`<div style="color:var(--red);padding:20px">筛选启动失败：${e.message}</div>`;
+    return;
+  }
+  // Poll until done
+  await pollScreenProgress();
+}
+function pollScreenProgress(){
+  return new Promise((resolve, reject) => {
+    const poll = setInterval(async () => {
+      try {
+        const s = await (await fetch('/api/screen_status')).json();
+        if(s.error){ clearInterval(poll); reject(new Error(s.error)); return; }
+        const p = s.progress;
+        if(p){
+          const bar = document.getElementById('screenProgBar');
+          const txt = document.getElementById('screenProgText');
+          const pct = document.getElementById('screenProgPct');
+          if(bar) bar.style.width = p.pct + '%';
+          if(txt) txt.textContent = p.phase;
+          if(pct) pct.textContent = p.pct + '%';
+        }
+        if(s.done){
+          clearInterval(poll);
+          const r = await fetch('/api/screen_result');
+          if(!r.ok){ reject(new Error('获取结果失败')); return; }
+          SCREEN_RESULT = await r.json();
+          renderScreenResult();
+          resolve();
+        }
+      } catch(e){ clearInterval(poll); reject(e); }
+    }, 500);
+  });
 }
 
 // ================= 内嵌个股详情（不跳新页，返回即回到筛选结果） =================
