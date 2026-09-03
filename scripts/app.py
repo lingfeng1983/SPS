@@ -469,6 +469,8 @@ def _do_screen_worker(conds, stop_pct):
         _screen_task["progress"] = {"phase": "完成", "pct": 100}
     except Exception as e:
         _screen_task["error"] = str(e)
+        import traceback
+        traceback.print_exc()
     finally:
         _screen_task["active"] = False
         _screen_task["done"] = True
@@ -481,6 +483,14 @@ def api_screen_status():
         "done": _screen_task["done"],
         "progress": _screen_task["progress"],
         "error": _screen_task["error"]})
+
+@app.route("/api/screen_reset", methods=["POST"])
+def api_screen_reset():
+    """手动重置卡住的筛选任务"""
+    _screen_task["active"] = False
+    _screen_task["done"] = True
+    _screen_task["error"] = None
+    return jsonify({"ok": True})
 
 @app.route("/api/screen_result")
 def api_screen_result():
