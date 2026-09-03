@@ -1405,6 +1405,15 @@ const PAT_CN={FLAT_BREAKOUT:'平台突破',W_BOTTOM:'W底',CUP_HANDLE:'杯柄',
               POCKET_PIVOT:'口袋支点'};
 
 async function runScanData(){
+  // 检查数据是否已是最新（今天），若是则提示
+  try {
+    const j = await (await fetch('/api/data_status')).json();
+    if (j.ready && j.age_days <= 1) {
+      if (!confirm(`数据已是最新（${j.last_date}），暂时不需要更新。\n\n仍要重新拉取所有数据吗？（耗时较长）`)) {
+        return;
+      }
+    }
+  } catch(e) {}
   // 更新数据缓存：拉取全市场日线+财务（供筛选与回测使用）
   const body={action:'scan', max_stocks:0};
   const r=await fetch('/api/run',{method:'POST',

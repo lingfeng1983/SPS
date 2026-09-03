@@ -98,9 +98,23 @@ def run(symbols: list[str], start: str = "20190101",
         print(f"  HiThink 不可用，回退到 akshare 串行拉取...")
 
     # 批量获取：线程数 5（HiThink 限速比东财宽松）
-    daily = batch_get_daily(symbols, start=start, end=None,
-                            max_workers=5, on_progress=_on_progress)
-    print(f"\n  成功拉取 {len(daily)}/{total} 只股票日线")
+    n_cached = len([s for s in symbols if (DATA_DIR / "daily" / f"{s.replace('.','_')}_{start}_latest.parquet").exists()
+                    or (DATA_DIR / "daily" / f"{s.replace('.','_')}_{start}_latest_akshare.parquet").exists()])
+    if n_cached == total:
+        print(f"[progress] {total}/{total} (100%)")
+        print(f"  所有 {total} 只股票日线缓存已存在，无需下载")
+        daily = {}
+        for sym in symbols:
+            cache_file = DATA_DIR / "daily" / f"{sym.replace('.','_')}_{start}_latest.parquet"
+            akshare_cache = DATA_DIR / "daily" / f"{sym.replace('.','_')}_{start}_latest_akshare.parquet"
+            if cache_file.exists():
+                daily[sym] = pd.read_parquet(cache_file)
+            elif akshare_cache.exists():
+                daily[sym] = pd.read_parquet(akshare_cache)
+    else:
+        daily = batch_get_daily(symbols, start=start, end=None,
+                                max_workers=5, on_progress=_on_progress)
+        print(f"\n  成功拉取 {len(daily)}/{total} 只股票日线")
 
     # ====================================================
     # 第二步：形态检测（保持不变，逐只跑检测器）

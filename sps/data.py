@@ -44,13 +44,19 @@ def _hithink_available() -> bool:
         return False
     try:
         r = subprocess.run(
-            ["hithink-finance", "auth", "status", "--format", "json"],
-            capture_output=True, text=True, timeout=10
+            "hithink-finance auth status --format json",
+            capture_output=True, text=True, timeout=10, shell=True
         )
         if r.returncode != 0:
             return False
-        data = json.loads(r.stdout)
-        return data.get("ok", False) and data.get("data", {}).get("configured", False)
+        # 解析 NDJSON（首行可能是 type:message）
+        for line in r.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('{"type":"message"'):
+                continue
+            data = json.loads(line)
+            return data.get("ok", False) and data.get("data", {}).get("configured", False)
+        return False
     except Exception:
         return False
 
@@ -80,7 +86,7 @@ def get_daily_hithink(symbol: str, start: str | None = None,
         cmd += ["--end-ms", str(int(pd.Timestamp(end).timestamp() * 1000))]
 
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, shell=True)
         if r.returncode != 0:
             return None
         # 解析 NDJSON（首行可能是 type:message，后面才是 JSON）
