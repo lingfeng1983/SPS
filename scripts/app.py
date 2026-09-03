@@ -261,6 +261,27 @@ def api_ai_interpret():
     return jsonify(screen_interpretation(SCREEN_LAST["result"]))
 
 
+@app.route("/api/hithink/config", methods=["GET"])
+def api_hithink_cfg_get():
+    from sps.hithink_cfg import get_hithink_cfg
+    return jsonify(get_hithink_cfg())
+
+
+@app.route("/api/hithink/config", methods=["POST"])
+def api_hithink_cfg_set():
+    from sps.hithink_cfg import save_hithink_cfg, get_hithink_cfg
+    body = request.get_json(force=True) or {}
+    save_hithink_cfg(body)
+    return jsonify({"ok": True, **get_hithink_cfg()})
+
+
+@app.route("/api/hithink/test", methods=["POST"])
+def api_hithink_cfg_test():
+    from sps.hithink_cfg import test_hithink
+    body = request.get_json(force=True) or {}
+    return jsonify(test_hithink(body.get("api_key", "")))
+
+
 @app.route("/api/data_status")
 def api_data_status():
     """数据新鲜度：最新缓存K线日期与滞后天数。"""
@@ -1183,11 +1204,16 @@ def api_stop():
 def api_job():
     progress = None
     if _job["log"]:
-        for line in reversed(_job["log"][-20:]):
+        for line in reversed(_job["log"][-50:]):
             if "[progress]" in line:
                 try:
-                    parts = line.split("[progress]")[-1].strip().split("/")
-                    cur, tot = int(parts[0]), int(parts[1])
+                    after = line.split("[progress]")[-1].strip()
+                    # 支持 "0/5682" 和 "500/5682 (8%)" 两种格式
+                    parts = after.split("/")
+                    cur = int(parts[0])
+                    # tot 可能带括号百分比： "5682 (8%)"
+                    tot_part = parts[1].split("(")[0].strip()
+                    tot = int(tot_part)
                     progress = {"current": cur, "total": tot, "pct": round(cur/tot*100) if tot else 0}
                 except (ValueError, IndexError):
                     pass
@@ -1400,10 +1426,10 @@ function setFresh(state, text){
 async function checkFresh(){
   try{
     const j=await (await fetch('/api/data_status')).json();
-    if(!j.ready){ setFresh('stale','数据未就绪'); return; }
+    if(!j.ready){ setFresh('stale','数据未就绪，请先点击"更新数据"'); return; }
     const days=j.age_days;
-    if(days<=1) setFresh('ok',`数据截至 ${j.last_date} ✅ 最新`);
-    else if(days<=4) setFresh('ok',`数据截至 ${j.last_date}（${days}天前，可能为节假日）`);
+    if(days<=1) setFresh('ok',`数据截至 ${j.last_date} ✅ 最新（今天）`);
+    else if(days<=4) setFresh('ok',`数据截至 ${j.last_date}（${days} 天前，可能为节假日）`);
     else setFresh('stale',`⚠️ 数据截至 ${j.last_date}，已落后 ${days} 天，建议更新`);
   }catch(e){ setFresh('ok','数据状态未知'); }
 }
@@ -1420,7 +1446,7 @@ function pollJobFresh(){
       if(prog && prog.total>0){
         bar.style.width=prog.pct+'%';
         bar.style.animation='';
-        if(txt) txt.textContent=`${prog.current}/${prog.total} (${prog.pct}%)`;
+        if(txt) txt.textContent=`更新数据中… ${prog.current}/${prog.total} (${prog.pct}%)`;
       } else {
         bar.style.width='30%';
         bar.style.animation='progPulse 1.4s ease-in-out infinite';
@@ -2306,7 +2332,9 @@ function resort(){
 // ================= AI 解读 & 设置（用户自带 API Key，本地存储） =================
 async function openAISettings(){
   let cfg={base_url:'https://api.openai.com/v1', model:'', api_key_masked:'', api_key_set:false};
+  let hitCfg={api_key_set:false, api_key_masked:''};
   try{ cfg={...cfg, ...(await (await fetch('/api/ai/config')).json())}; }catch(e){}
+  try{ hitCfg=(await (await fetch('/api/hithink/config')).json()); }catch(e){}
   // 复用回放弹层思路：简单模态
   let modal=document.getElementById('aiModal');
   if(!modal){
@@ -2330,6 +2358,20 @@ async function openAISettings(){
       <label>模型名 Model
         <input id="aiModel" value="${cfg.model||''}" placeholder="deepseek-chat / gpt-4o-mini / qwen-plus"
           style="width:100%;padding:7px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border);margin-top:3px"></label>
+    </div>
+    <div style="border-top:1px solid var(--border);margin-top:16px;padding-top:14px">
+      <div style="font-size:13px;font-weight:800;margin-bottom:4px">📊 数据源 API (HiThink Financial)</div>
+      <div style="font-size:11.5px;color:var(--muted);line-height:1.7;margin-bottom:8px">
+        同花顺官方数据源，稳定可靠。注册获取地址：<a href="https://github.com/HiThink-Tech/Financial-API" target="_blank" style="color:var(--accent)">HiThink-Tech/Financial-API</a>
+        Key 仅保存在本机 data/meta/hithink_config.json。</div>
+      <label>HiThink API Key ${hitCfg.api_key_set?`<span style="color:var(--green)">（已设置 ${hitCfg.api_key_masked}，留空则不修改）</span>`:'<span style="color:var(--amber)">（推荐填写）</span>'}
+        <input id="hitKey" type="password" placeholder="${hitCfg.api_key_set?'保持不变':'sk-...'}"
+          style="width:100%;padding:7px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border);margin-top:3px"></label>
+      <div id="hitTestResult" style="font-size:12px;margin-top:6px;min-height:16px"></div>
+      <div style="display:flex;gap:6px;margin-top:6px">
+        <button onclick="hitTestConn()" style="padding:5px 12px;font-size:11px;background:#33415580">🔗 测试</button>
+        <button onclick="hitSaveCfg()" style="padding:5px 12px;font-size:11px;background:#16a34a">💾 保存 HiThink Key</button>
+      </div>
     </div>
     <div id="aiTestResult" style="font-size:12px;margin-top:10px;min-height:16px"></div>
     <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
@@ -2360,6 +2402,26 @@ async function aiTestConn(){
   el.innerHTML='<span style="color:var(--muted)">测试中…</span>';
   const r=await fetch('/api/ai/test',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(v)});
+  const j=await r.json();
+  el.innerHTML = j.ok
+    ? `<span style="color:var(--green)">✅ 连接成功（${j.elapsed}s）：${j.reply||'OK'}</span>`
+    : `<span style="color:var(--red)">❌ ${j.error||'失败'}</span>`;
+}
+async function hitSaveCfg(){
+  const k=document.getElementById('hitKey').value.trim();
+  if(!k){ alert('请先填写 HiThink API Key'); return; }
+  const r=await fetch('/api/hithink/config',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:k})});
+  const j=await r.json();
+  if(j.ok){ alert('✅ HiThink API Key 已保存'); document.getElementById('hitKey').value=''; }
+  else alert('保存失败');
+}
+async function hitTestConn(){
+  const k=document.getElementById('hitKey').value.trim();
+  const el=document.getElementById('hitTestResult');
+  el.innerHTML='<span style="color:var(--muted)">测试中…</span>';
+  const r=await fetch('/api/hithink/test',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:k})});
   const j=await r.json();
   el.innerHTML = j.ok
     ? `<span style="color:var(--green)">✅ 连接成功（${j.elapsed}s）：${j.reply||'OK'}</span>`
