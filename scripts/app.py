@@ -348,6 +348,7 @@ SCREEN_LAST = {"result": None}   # 最近一次筛选结果（AI 解读用）
 @app.route("/api/screen", methods=["POST"])
 def api_screen():
     """启动筛选任务（后台运行，通过 /api/screen_status 查询进度）。"""
+    from sps.screener import INDICATORS, validate_conditions
     if _screen_task["active"]:
         return jsonify({"error": "已有筛选任务在运行中"}), 409
     body = request.get_json(force=True) or {}
