@@ -75,10 +75,11 @@ def test_hithink(api_key: str = "") -> dict:
     # 临时写入 CLI 测试
     try:
         subprocess.run(
-            ["hithink-finance", "auth", "login", "--replace", "--api-key-stdin"],
+            "hithink-finance auth login --replace --api-key-stdin",
             input=api_key.encode("utf-8"),
             timeout=15,
             check=False,
+            shell=True,
         )
     except Exception:
         pass
@@ -88,9 +89,9 @@ def test_hithink(api_key: str = "") -> dict:
         import time as _t
         t0 = _t.time()
         result = subprocess.run(
-            ["hithink-finance", "market", "history",
-             "--thscode", "000001.SZ", "--format", "json"],
+            "hithink-finance market history --thscode 000001.SZ --format json",
             capture_output=True, text=True, timeout=30, check=False,
+            shell=True,
         )
         elapsed = round(_t.time() - t0, 1)
         if result.returncode == 0 and "1991" in result.stdout:
