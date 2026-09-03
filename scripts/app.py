@@ -1000,18 +1000,24 @@ def api_screen_detail(symbol: str):
     from sps.screener import INDICATORS, entry_and_stop
     from flask import request as _req
     df = None
+    last_date = None
     for f in DATA_DIR.glob(f"daily/{symbol}_*.parquet"):
         try:
             raw = pd.read_parquet(f)
         except Exception:
             continue
         if isinstance(raw.index, pd.DatetimeIndex):
-            df = raw
+            candidate = raw
         elif "date" in raw.columns:
-            df = raw.set_index(pd.to_datetime(raw["date"]))
-        if df is not None and {"O", "H", "L", "C", "V"} <= set(df.columns):
-            break
-        df = None
+            candidate = raw.set_index(pd.to_datetime(raw["date"]))
+        else:
+            continue
+        if candidate is not None and {"O", "H", "L", "C", "V"} <= set(candidate.columns):
+            # 选择最后K线日期最新的文件
+            cand_last = candidate.index[-1]
+            if last_date is None or cand_last > last_date:
+                df = candidate
+                last_date = cand_last
     if df is None or not {"O", "H", "L", "C", "V"} <= set(df.columns):
         return jsonify({"error": "no kline"}), 404
 
