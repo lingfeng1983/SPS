@@ -81,32 +81,46 @@ def run(symbols: list[str], start: str = "20190101",
     idx = get_index("000300", start="20180101")
     regime = market_regime(idx["C"])
 
-    print(f"scanning {total} symbols ...")
     print(f"[progress] 0/{total}")
-    cache = {}
-    fund_filtered = 0
+
+    # ====================================================
+    # 第一步：批量获取日线（HiThink 并发 + akshare 回退）
+    # ====================================================
+    from sps.data import HIT_HINK_AVAILABLE, batch_get_daily
+
+    def _on_progress(done, tot):
+        pct = round(done / tot * 100)
+        print(f"[progress] {done}/{tot} ({pct}%)")
+
+    if HIT_HINK_AVAILABLE:
+        print(f"  使用 HiThink Finance-API 并发拉取（线程数=5）...")
+    else:
+        print(f"  HiThink 不可用，回退到 akshare 串行拉取...")
+
+    # 批量获取：线程数 5（HiThink 限速比东财宽松）
+    daily = batch_get_daily(symbols, start=start, end=None,
+                            max_workers=5, on_progress=_on_progress)
+    print(f"\n  成功拉取 {len(daily)}/{total} 只股票日线")
+
+    # ====================================================
+    # 第二步：形态检测（保持不变，逐只跑检测器）
+    # ====================================================
     for i, sym in enumerate(symbols):
-        if i > 0 and i % 20 == 0:
-            print(f"[progress] {i}/{total}")
+        df = daily.get(sym)
+        if df is None or len(df) < 60:
+            continue
         kind = (kind_map or {}).get(sym, "stock")
-        # ---- 第一关：基本面红线（仅股票；ETF无财务报表）----
         if kind == "stock":
             fu = get_fundamental(sym)
             ok, hits = check_redlines(sym, fundamental=fu)
             if not ok:
-                fund_filtered += 1
                 continue
-        try:
-            df = get_daily(sym, start=start, kind=kind)
-        except Exception as e:  # noqa: BLE001
-            print(f"  [skip] {sym}: {e}")
-            continue
         sym_events = []
         for det_cls in ALL_DETECTORS:
             det = det_cls()
             try:
                 evs = det.scan(df, symbol=sym)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 print(f"  [warn] {det_cls.__name__}.scan({sym}) 失败: {e}")
                 continue
             sym_events.extend(e.to_dict() for e in evs)
@@ -129,7 +143,8 @@ def run(symbols: list[str], start: str = "20190101",
                                   "signal_date": d["signal_date"], "fwd": fwd,
                                   "entry": A})
             events_all.append(d)
-        print(f"  scanned {sym}: total so far={len(events_all)}")
+        if (i + 1) % 100 == 0:
+            print(f"  已检测 {i+1}/{total}, 事件累计 {len(events_all)}")
 
     # RPS 表（基于本次全部已加载股票）
     data = {}

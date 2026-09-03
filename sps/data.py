@@ -1,16 +1,20 @@
-"""数据层：AKShare 拉取 + 本地 Parquet 缓存。
+"""数据层：HiThink（主）+ akshare（备）混合数据源。
 
-设计要点（对应规格书 0.1.1）：
-- 前复权 OHLC 用于形态几何；成交量用原始量
-- 股票列表按日期快照保存，避免幸存者偏差
-- 全部落地为 parquet，重复运行不重拉
+设计：
+- HiThink Finance-API：同花顺官方，稳定、支持批量，需 API Key
+- akshare：免费备用源，HiThink 失败时自动回退
+- 本地 Parquet 缓存避免重复拉取
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import shutil
+import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -28,168 +32,251 @@ META_DIR = DATA_DIR / "meta"
 
 
 def _ensure_dirs():
-    for d in (DATA_DIR, DAILY_DIR, META_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+    DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def today_str() -> str:
-    return dt.date.today().isoformat()
+# ================================================================ HiThink 检测
+
+def _hithink_available() -> bool:
+    """HiThink CLI 是否可用（已安装且已配置 API Key）"""
+    if shutil.which("hithink-finance") is None:
+        return False
+    try:
+        r = subprocess.run(
+            ["hithink-finance", "auth", "status", "--format", "json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode != 0:
+            return False
+        data = json.loads(r.stdout)
+        return data.get("ok", False) and data.get("data", {}).get("configured", False)
+    except Exception:
+        return False
 
 
-def get_all_symbols(trade_date: str | None = None,
-                    include_etf: bool = True,
-                    exclude_st_bj: bool = True) -> pd.DataFrame:
-    """股票+ETF 列表快照（含代码/名称），缓存按日。
+HIT_HINK_AVAILABLE = _hithink_available()
 
-    exclude_st_bj=True 时排除：ST/*ST/退市整理、北交所、新三板。
-    include_etf=True 时附带场内 ETF（fund_etf_spot_em）。
-    """
+
+# ================================================================ HiThink 数据获取
+
+def _symbol_to_thscode(symbol: str) -> str:
+    """600519 → 600519.SH, 000001 → 000001.SZ"""
+    if symbol.endswith(('.SH', '.SZ', '.BJ')):
+        return symbol
+    if symbol.startswith(('6', '9', '5')):
+        return f"{symbol}.SH"
+    return f"{symbol}.SZ"
+
+
+def get_daily_hithink(symbol: str, start: str | None = None,
+                      end: str | None = None) -> pd.DataFrame | None:
+    """从 HiThink 获取单只股票日线。失败返回 None。"""
+    thscode = _symbol_to_thscode(symbol)
+    cmd = ["hithink-finance", "market", "history", "--thscode", thscode, "--format", "json"]
+    if start:
+        cmd += ["--start-ms", str(int(pd.Timestamp(start).timestamp() * 1000))]
+    if end:
+        cmd += ["--end-ms", str(int(pd.Timestamp(end).timestamp() * 1000))]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return None
+        # 解析 NDJSON（首行可能是 type:message，后面才是 JSON）
+        for line in r.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('{"type":"message"'):
+                continue
+            data = json.loads(line)
+            if not data.get("ok"):
+                continue
+            items = data.get("data", {}).get("items", [])
+            if not items:
+                continue
+            df = pd.DataFrame(items)
+            df["date"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df = df.rename(columns={
+                "open": "O", "high": "H", "low": "L", "close": "C",
+                "volume": "V", "amount": "amount"
+            })
+            for c in ("O", "H", "L", "C", "V"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            return df[["date", "O", "H", "L", "C", "V"]].set_index("date").sort_index()
+    except Exception:
+        pass
+    return None
+
+
+def get_batch_hithink(symbols: list[str], start: str | None = None,
+                      end: str | None = None, max_workers: int = 5,
+                      on_progress=None) -> dict[str, pd.DataFrame]:
+    """并发批量从 HiThink 下载日线。返回 {symbol: df}。"""
+    results = {}
+
+    def _fetch_one(sym):
+        df = get_daily_hithink(sym, start, end)
+        return sym, df
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, sym): sym for sym in symbols}
+        done_count = 0
+        total = len(symbols)
+        for future in as_completed(futures):
+            done_count += 1
+            try:
+                sym, df = future.result(timeout=60)
+                if df is not None and len(df) > 0:
+                    results[sym] = df
+                if on_progress and done_count % 50 == 0:
+                    on_progress(done_count, total)
+            except Exception:
+                pass
+    return results
+
+
+# ================================================================ akshare 备用
+
+def get_daily_akshare(symbol: str, start: str = "20150101",
+                      end: str | None = None, kind: str = "stock") -> pd.DataFrame:
+    """akshare 备用数据获取（带 5 次退避重试）"""
+    import akshare as ak
+
     _ensure_dirs()
-    d = trade_date or today_str()
-    f = META_DIR / f"stock_list_{d}.parquet"
+    tag = f"{start}_{end or 'latest'}"
+    f = DAILY_DIR / f"{symbol.replace('.', '_')}_{tag}_akshare.parquet"
     if f.exists():
         return pd.read_parquet(f)
-    import akshare as ak
-    df = None
+
+    end_s = end or dt.date.today().strftime("%Y%m%d")
+    frames = []
     last_err = None
-    for attempt in range(4):
+
+    fetch_ak = (lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily",
+                 start_date=start, end_date=end_s, adjust="qfq"))
+    if kind != "etf":
+        fetch_ak = (lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                     start_date=start, end_date=end_s, adjust="qfq"))
+
+    for attempt in range(5):
         try:
-            df = ak.stock_info_a_code_name()
+            raw = fetch_ak()
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
-            time.sleep(5 + attempt * 5)
-    if df is None:
-        # 回退：用最近一次缓存列表
-        old = sorted(META_DIR.glob("stock_list_*.parquet"))
-        if old:
-            print(f"[warn] list fetch failed ({last_err}), using {old[-1].name}")
-            return pd.read_parquet(old[-1])
-        raise RuntimeError(f"symbol list failed: {last_err}")
-    df = df.rename(columns={"code": "symbol", "name": "name"})
-    df["symbol"] = df["symbol"].astype(str).str.zfill(6)
-    df["market"] = df["symbol"].str[:2].map(
-        {"60": "SH", "68": "STAR", "00": "SZ", "30": "ChiNext",
-         "43": "BJ", "83": "BJ", "87": "BJ", "92": "BJ"}
-    ).fillna("OTHER")
-    df["kind"] = "stock"
-    # ---- 排除 ST / 退市 / 北交所 / 新三板 ----
-    if exclude_st_bj:
-        name_up = df["name"].str.upper()
-        mask_st = name_up.str.contains("ST") | name_up.str.contains("退")
-        mask_bj = (df["market"] == "BJ") | (df["market"] == "OTHER")
-        df = df[~mask_st & ~mask_bj]
-    # ---- ETF 场内基金 ----
-    if include_etf:
-        etf = None
-        for attempt in range(3):
-            try:
-                etf = ak.fund_etf_spot_em()
-                break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                time.sleep(4 + attempt * 4)
-        if etf is not None and not etf.empty:
-            cols = {c: c for c in etf.columns}
-            code_col = next(c for c in etf.columns if "代码" in c)
-            name_col = next(c for c in etf.columns if "名称" in c)
-            e2 = pd.DataFrame({
-                "symbol": etf[code_col].astype(str).str.zfill(6),
-                "name": etf[name_col].astype(str),
-            })
-            e2["market"] = e2["symbol"].str[:1].map({"5": "SH", "1": "SZ"}).fillna("OTHER")
-            e2["kind"] = "etf"
-            # 排除货币/债券类可选——默认全保留，用户可自行过滤
-            df = pd.concat([df, e2], ignore_index=True)
-        else:
-            print(f"[warn] ETF list fetch failed ({last_err}), stocks only")
-    df.to_parquet(f, index=False)
+            time.sleep(3 + attempt * 4)
+    else:
+        raise RuntimeError(f"{symbol} akshare failed: {last_err}")
+
+    if raw is None or raw.empty:
+        raise RuntimeError(f"no data for {symbol}")
+
+    g = raw.rename(columns={
+        "日期": "date", "开盘": "O", "收盘": "C", "最高": "H",
+        "最低": "L", "成交量": "V", "成交额": "amount"
+    })
+    g["date"] = pd.to_datetime(g["date"])
+    out = g.set_index("date").sort_index()
+    out[["O", "H", "L", "C", "V"]].to_parquet(f)
+    return out
+
+
+# ================================================================ 统一入口
+
+def get_daily(symbol: str, start: str = "20150101",
+              end: str | None = None, kind: str = "stock") -> pd.DataFrame:
+    """统一入口：HiThink 优先 → akshare 备用"""
+    _ensure_dirs()
+
+    # 1. 检查缓存（已有数据直接返回）
+    cache_tag = f"{start}_{end or 'latest'}"
+    cache_file = DAILY_DIR / f"{symbol.replace('.', '_')}_{cache_tag}.parquet"
+    if cache_file.exists():
+        return pd.read_parquet(cache_file)
+
+    akshare_cache = DAILY_DIR / f"{symbol.replace('.', '_')}_{cache_tag}_akshare.parquet"
+    if akshare_cache.exists():
+        return pd.read_parquet(akshare_cache)
+
+    # 2. HiThink（如果可用）
+    if HIT_HINK_AVAILABLE:
+        df = get_daily_hithink(symbol, start, end)
+        if df is not None and len(df) > 0:
+            df[["O", "H", "L", "C", "V"]].to_parquet(cache_file)
+            return df
+
+    # 3. akshare 备用
+    df = get_daily_akshare(symbol, start, end, kind=kind)
+    df[["O", "H", "L", "C", "V"]].to_parquet(akshare_cache)
     return df
 
 
-def get_daily(symbol: str, start: str = "20150101", end: str | None = None,
-              adjust: str = "qfq", kind: str = "stock") -> pd.DataFrame:
-    """单只股票/ETF日线。返回列: date,O,H,L,C,V(原始),amount。
-
-    kind='etf' 时走东财基金接口（前复权）。
-    """
-    import akshare as ak
+def batch_get_daily(symbols: list[str], start: str = "20150101",
+                    end: str | None = None, max_workers: int = 5,
+                    on_progress=None) -> dict[str, pd.DataFrame]:
+    """批量获取日线。HiThink 并发 → 失败回退 akshare。"""
     _ensure_dirs()
-    tag = f"{adjust}_{start}_{end or 'latest'}"
-    f = DAILY_DIR / f"{symbol.replace('.', '_')}_{tag}.parquet"
-    if f.exists():
-        return pd.read_parquet(f)
-    end_s = end or today_str().replace("-", "")
-    frames = []
-    # 东财 stock_zh_a_hist 的"成交量"本身就是原始成交量（股），
-    # 前复权只改价格不改量 → 一次调用同时拿到 qfq 价格 + 原始量。
-    adj = adjust or ""
-    raw = None
-    last_err = None
-    fetch = (lambda: ak.fund_etf_hist_em(symbol=symbol, period="daily",
-             start_date=start, end_date=end_s, adjust=adj))
-    if kind != "etf":
-        fetch = (lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                 start_date=start, end_date=end_s, adjust=adj))
-    for attempt in range(5):  # 连接不稳：5次退避重试
-        try:
-            raw = fetch()
-            break
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            time.sleep(3 + attempt * 4)
-    if raw is None or getattr(raw, "empty", True):
-        # ---- 备用源：新浪财经（无复权，但量价完整）----
-        try:
-            raw2 = None
-            if kind == "etf":
-                sina_sym = ("sh" if symbol.startswith("5") else "sz") + symbol
-                raw2 = ak.fund_etf_hist_sina(symbol=sina_sym)
-                if raw2 is not None and not raw2.empty and start:
-                    raw2["date"] = pd.to_datetime(raw2["date"])
-                    raw2 = raw2[raw2["date"] >= pd.to_datetime(start)]
-            else:
-                prefix = "sh" if symbol.startswith(("6", "9", "5")) else "sz"
-                raw2 = ak.stock_zh_a_daily(symbol=prefix + symbol, start_date=start,
-                                           end_date=end_s)
-            if raw2 is not None and not raw2.empty:
-                cols_map = {"open": "O", "close": "C", "high": "H", "low": "L",
-                            "volume": "V", "amount": "amount"}
-                g = raw2.rename(columns=cols_map)
-                g["date"] = pd.to_datetime(g["date"])
-                keep = ["date"] + [c for c in ("O","H","L","C","V","amount") if c in g.columns]
-                g = g[keep].dropna(subset=["C"])
-                out = g.set_index("date").sort_index()
-                # 补齐缺列（sina ETF 无 amount 时置0）
-                for c in ("O","H","L","C","V"):
-                    if c not in out.columns:
-                        out[c] = out["C"] if c != "V" else 0
-                out = out[["O","H","L","C","V"]] if "amount" not in out.columns else out
-                out.to_parquet(f)
-                return out
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-    if raw is None:
-        raise RuntimeError(f"{symbol} hist failed: {last_err}")
-    if raw is not None and not raw.empty:
-        g = raw.rename(columns={
-            "日期": "date", "开盘": "O", "收盘": "C", "最高": "H",
-            "最低": "L", "成交量": "V", "成交额": "amount"})[
-            ["date", "O", "H", "L", "C", "V", "amount"]]
-        g["date"] = pd.to_datetime(g["date"])
-        out = g.set_index("date").sort_index()
-        out.to_parquet(f)
-        return out
-    raise RuntimeError(f"no data for {symbol}")
+    results = {}
+    need_fetch = []
 
+    # 1. 检查缓存
+    cache_tag = f"{start}_{end or 'latest'}"
+    for sym in symbols:
+        cache_file = DAILY_DIR / f"{sym.replace('.', '_')}_{cache_tag}.parquet"
+        akshare_cache = DAILY_DIR / f"{sym.replace('.', '_')}_{cache_tag}_akshare.parquet"
+        if cache_file.exists():
+            results[sym] = pd.read_parquet(cache_file)
+        elif akshare_cache.exists():
+            results[sym] = pd.read_parquet(akshare_cache)
+        else:
+            need_fetch.append(sym)
+
+    if not need_fetch:
+        return results
+
+    # 2. HiThink 批量（如果可用）
+    if HIT_HINK_AVAILABLE:
+        hithink_results = get_batch_hithink(need_fetch, start, end,
+                                            max_workers=max_workers,
+                                            on_progress=on_progress)
+        results.update(hithink_results)
+        # 缓存 HiThink 结果
+        cache_tag = f"{start}_{end or 'latest'}"
+        for sym, df in hithink_results.items():
+            cache_file = DAILY_DIR / f"{sym.replace('.', '_')}_{cache_tag}.parquet"
+            df[["O", "H", "L", "C", "V"]].to_parquet(cache_file)
+        need_fetch = [s for s in need_fetch if s not in hithink_results]
+
+    # 3. akshare 回退（剩余未成功的）
+    if need_fetch:
+        def _fetch_ak(sym):
+            try:
+                return sym, get_daily_akshare(sym, start, end)
+            except Exception:
+                return sym, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_ak, sym): sym for sym in need_fetch}
+            for future in as_completed(futures):
+                try:
+                    sym, df = future.result(timeout=120)
+                    if df is not None and len(df) > 0:
+                        results[sym] = df
+                except Exception:
+                    pass
+
+    return results
+
+
+# ================================================================ 其他辅助函数（保留兼容性）
 
 def get_index(symbol: str = "000300", start: str = "20180101",
               end: str | None = None) -> pd.DataFrame:
-    """基准指数日线（默认沪深300），列: C。带重试与缓存。"""
+    """基准指数日线（默认沪深300）。"""
     import akshare as ak
     _ensure_dirs()
-    end_s = end or today_str().replace("-", "")
-    f = DAILY_DIR / f"index_{symbol}_{start}_{end_s}.parquet"
+    end_s = end or dt.date.today().strftime("%Y%m%d")
+    f = DATA_DIR / "meta" / f"index_{symbol}_{start}_{end_s}.parquet"
     if f.exists():
         return pd.read_parquet(f)
     raw = None
@@ -199,49 +286,129 @@ def get_index(symbol: str = "000300", start: str = "20180101",
             raw = ak.index_zh_a_hist(symbol=symbol, period="daily",
                                      start_date=start, end_date=end_s)
             break
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
             time.sleep(3 + attempt * 4)
-    if raw is None or getattr(raw, "empty", True):
-        # 备用：新浪指数源
-        sina_sym = {"000300": "sh000300", "000001": "sh000001"}.get(symbol)
-        if sina_sym:
-            try:
-                raw2 = ak.stock_zh_index_daily(symbol=sina_sym)
-                if raw2 is not None and not raw2.empty:
-                    g2 = raw2.rename(columns={"date": "date", "close": "C"})
-                    g2["date"] = pd.to_datetime(g2["date"])
-                    out = g2[["date", "C"]].set_index("date").sort_index()
-                    out = out[out.index >= pd.Timestamp(start)]
-                    out.to_parquet(f)
-                    return out
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-    if raw is None or getattr(raw, "empty", True):
+    if raw is None or raw.empty:
         raise RuntimeError(f"index {symbol} failed: {last_err}")
-    g = raw.rename(columns={"日期": "date", "收盘": "C"})[["date", "C"]]
+    g = raw.rename(columns={"日期": "date", "收盘": "C"})
     g["date"] = pd.to_datetime(g["date"])
     out = g.set_index("date").sort_index()
-    out.to_parquet(f)
+    out[["C"]].to_parquet(f)
     return out
 
 
-def load_universe(symbols: list[str] | None = None, start: str = "20150101",
-                  max_stocks: int | None = None) -> dict[str, pd.DataFrame]:
-    """批量加载全市场日线到内存字典。max_stocks 用于小规模试跑。"""
-    lst = get_all_symbols()
-    syms = symbols or lst["symbol"].tolist()
-    if max_stocks:
-        syms = syms[:max_stocks]
-    data = {}
-    failed = []
-    for i, s in enumerate(syms):
+def get_fundamental(symbol: str) -> dict | None:
+    """保留兼容：走 akshare 财务摘要"""
+    import akshare as ak
+    _ensure_dirs()
+    f = META_DIR / "fundamental" / f"{symbol}.json"
+    if f.exists():
+        return json.loads(f.read_text(encoding="utf-8"))
+    try:
+        fa = ak.stock_financial_abstract_ths(symbol=symbol, indicator="按报告期")
+        if fa is not None and not fa.empty:
+            row = fa.iloc[-1]
+            out = {
+                "report_date": str(row.get("报告期", "")),
+                "net_profit": _parse_num(row.get("净利润")),
+                "roe": _parse_num(row.get("净资产收益率")),
+                "debt_ratio": _parse_num(row.get("资产负债率")),
+                "gross_margin": _parse_num(row.get("销售毛利率")),
+                "net_margin": _parse_num(row.get("销售净利率")),
+                "revenue_yoy": _parse_num(row.get("营业总收入同比增长率")),
+                "profit_yoy": _parse_num(row.get("净利润同比增长率")),
+                "deduct_np": _parse_num(row.get("扣非净利润")),
+            }
+            f.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+            time.sleep(0.4)
+            return out
+    except Exception as e:
+        return {"_error": str(e)[:80]}
+    return {}
+
+
+def _parse_num(v) -> float | None:
+    """解析 '1.47亿' / '23.38%' / 12.3 等格式。"""
+    if v is None or v is False or v == "False":
+        return None
+    try:
+        s = str(v).strip()
+        if s.endswith("亿"):
+            return float(s[:-1]) * 1e8
+        if s.endswith("万亿"):
+            return float(s[:-2]) * 1e12
+        if s.endswith("%"):
+            return float(s[:-1])
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def check_redlines(symbol: str, name: str = "",
+                   fundamental: dict | None = None,
+                   listed_days: int | None = None) -> tuple[bool, list[str]]:
+    """基本面红线过滤。返回 (是否通过, 触发的红线列表)。"""
+    hits = []
+    if name:
+        n = name.upper()
+        if "ST" in n or "退" in n:
+            hits.append(f"R2:{name}")
+    if listed_days is not None and listed_days < 120:
+        hits.append(f"R1:listed{listed_days}d")
+    fu = fundamental or {}
+    np_ = fu.get("net_profit")
+    if np_ is not None and np_ < 0:
+        hits.append("R3:net_loss")
+    dnp = fu.get("deduct_np")
+    if dnp is not None and dnp < 0:
+        hits.append("R3x:deduct_loss")
+    roe = fu.get("roe")
+    if roe is not None and roe < 5:
+        hits.append(f"R4:roe{roe}")
+    dr = fu.get("debt_ratio")
+    is_financial = (dr is not None and dr > 75)
+    if not is_financial and dr is not None and dr > 70:
+        hits.append(f"R5:debt{dr}")
+    return (not hits, hits)
+
+
+def get_all_symbols(include_etf: bool = False, exclude_st_bj: bool = True) -> pd.DataFrame:
+    """获取 A 股股票列表。"""
+    import akshare as ak
+    _ensure_dirs()
+    today = dt.date.today().strftime("%Y%m%d")
+    cache = META_DIR / f"stock_list_{today}.parquet"
+    if cache.exists():
+        return pd.read_parquet(cache)
+
+    for attempt in range(3):
         try:
-            data[s] = get_daily(s, start=start)
-        except Exception as e:  # noqa: BLE001
-            failed.append((s, str(e)[:80]))
-        if i % 50 == 0:
-            print(f"  loaded {i}/{len(syms)}")
-    if failed:
-        (DATA_DIR / "failed.json").write_text(json.dumps(failed, ensure_ascii=False, indent=1))
-    return data
+            df = ak.stock_info_a_code_name()
+            df["symbol"] = df["code"].astype(str).str.zfill(6)
+            df["name"] = df["name"].astype(str)
+            if exclude_st_bj:
+                df = df[~df["name"].str.contains("ST|退|BJ", na=False)]
+            df = df[["symbol", "name"]].reset_index(drop=True)
+            df["kind"] = "stock"
+            df.to_parquet(cache)
+            return df
+        except Exception as e:
+            time.sleep(5 + attempt * 5)
+    raise RuntimeError(f"stock list fetch failed: {e}")
+
+
+def today_str() -> str:
+    return dt.date.today().strftime("%Y-%m-%d")
+
+
+def symbol_names() -> dict[str, str]:
+    """返回 {symbol: name} 映射。"""
+    cache_files = sorted(META_DIR.glob("stock_list_*.parquet"), reverse=True)
+    if not cache_files:
+        return {}
+    try:
+        df = pd.read_parquet(cache_files[0])
+        return dict(zip(df["symbol"], df.get("name", "")))
+    except Exception:
+        return {}
