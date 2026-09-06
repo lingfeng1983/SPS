@@ -526,3 +526,21 @@ def test_snapshot_dividend_day_falls_back_to_history(tmp_path, monkeypatch):
     assert (result["000001"]["C"] == 9.0).all()
     assert data_module.LAST_BATCH_STATS["snapshot_appended"] == 0
     assert data_module.LAST_BATCH_STATS["hithink_refreshed"] == 1
+
+
+def test_daily_cache_detail_buckets_with_gap_days(tmp_path):
+    """明细接口：未同步/长期停牌分桶正确，带落后天数与排序。"""
+    from sps.health import daily_cache_detail
+
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    _frame(["2026-09-04"], [10.0]).to_parquet(daily / "000001_latest.parquet")   # 最新
+    _frame(["2026-09-01"], [10.0]).to_parquet(daily / "000002_latest.parquet")   # 未同步(3天)
+    _frame(["2026-06-01"], [10.0]).to_parquet(daily / "000003_latest.parquet")   # 长期停牌
+
+    d = daily_cache_detail(daily)
+
+    assert d["ready"] is True
+    assert [x["symbol"] for x in d["stale"]] == ["000002"]
+    assert d["stale"][0]["gap_days"] == 3
+    assert [x["symbol"] for x in d["suspended"]] == ["000003"]

@@ -319,6 +319,18 @@ def api_data_status():
     return jsonify(summarize_daily_cache(DATA_DIR / "daily"))
 
 
+@app.route("/api/data_status_detail")
+def api_data_status_detail():
+    """数据状态逐票明细：未同步/长期停牌各是谁、落后多少天（详情弹窗用）。"""
+    from sps.health import daily_cache_detail
+    detail = daily_cache_detail(DATA_DIR / "daily")
+    names = symbol_names()
+    for bucket in ("stale", "suspended"):
+        for item in detail.get(bucket, []):
+            item["name"] = names.get(item["symbol"], "")
+    return jsonify(detail)
+
+
 @app.route("/api/health")
 def api_health():
     """Stable identity probe used by the repeat-launch guard."""
@@ -1581,7 +1593,7 @@ td.val{text-align:right;font-weight:600}
 
 <div id="main">
   <div id="freshBar" style="display:flex;gap:10px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:10px;padding:7px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px">
-    <span class="dot" id="freshDot"></span><span id="freshText">检查数据新鲜度…</span>
+    <span class="dot" id="freshDot"></span><span id="freshText" onclick="openDataDetail()" title="点击查看未同步明细：是谁、落后多少天、可能的原因" style="cursor:pointer">检查数据新鲜度…</span>
     <span id="candidateMeta" style="padding-left:8px;border-left:1px solid var(--border)">检查候选清单…</span>
     <div id="freshProgress" style="flex:1;margin-left:8px;max-width:200px">
       <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden">
@@ -1760,6 +1772,42 @@ async function busyHint(){
     const t=JOB_KIND_CN[job.kind]||'其他任务';
     alert(`当前正在执行：${t.replace(/（.*）/,'')}\n\n请等它完成，或点顶部任务横幅上的「⏹ 停止」后再试。`);
   }catch(e){ alert('已有任务在运行中'); }
+}
+
+async function openDataDetail(){
+  _modal(`
+    <div style="font-size:15px;font-weight:800;margin-bottom:4px">📊 数据状态明细</div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:10px">正在统计全部缓存…</div>`);
+  let j;
+  try{ j=await (await fetch('/api/data_status_detail')).json(); }
+  catch(e){ document.querySelector('.mcard').innerHTML='<div style="color:var(--red)">加载失败</div>'; return; }
+  const reason=(g)=>g<=0?'当日停牌（停牌无K线属正常）'
+    :g<=10?'多为当日/近期停牌，或数据源暂缺该票'
+    :'可能停牌中，或数据源未覆盖';
+  const row=(x,bucket)=>`<tr>
+    <td class="lbl" style="cursor:pointer" onclick="openDetail('${x.symbol}')">
+      <span style="color:var(--accent)">${x.symbol}</span> ${x.name||''}</td>
+    <td class="val">${x.last_date}</td>
+    <td class="val na" style="font-weight:400">${x.gap_days>999?'-':'落后 '+x.gap_days+' 个自然日'}</td>
+    <td class="val na" style="font-weight:400;font-size:10.5px;text-align:right">${bucket==='suspended'?'长期停牌/池外':reason(x.gap_days)}</td></tr>`;
+  const table=(list,bucket)=>list.length?`
+    <table style="margin-top:6px">${list.map(x=>row(x,bucket)).join('')}</table>`
+    :'<div style="color:var(--muted);font-size:12px;padding:6px 0">无</div>';
+  document.querySelector('.mcard').innerHTML=`
+    <div style="font-size:15px;font-weight:800;margin-bottom:8px">📊 数据状态明细</div>
+    <div style="font-size:12px;color:var(--muted);line-height:1.8;margin-bottom:10px">
+      数据截至 <b style="color:var(--text)">${j.last_date}</b>（最近已收盘交易日）·
+      覆盖 ${j.current_symbols}/${j.total_symbols} ·
+      数据源 HiThink ${j.hithink_cache_symbols||0} / AkShare ${j.akshare_cache_symbols||0}<br>
+      「未同步」= 最近30个自然日内没有最新K线的票，多为<b style="color:var(--text)">当日停牌</b>（停牌票本来就没有K线，属正常现象）；
+      长期停牌/池外ETF已单独归类，不影响正常使用。</div>
+    <div style="font-size:12.5px;font-weight:700;margin-bottom:2px">▸ 未同步 ${j.stale.length} 只</div>
+    ${table(j.stale,'stale')}
+    <div style="font-size:12.5px;font-weight:700;margin:12px 0 2px">▸ 长期停牌/池外 ${j.suspended.length} 只</div>
+    ${table(j.suspended,'suspended')}
+    <button style="width:auto;padding:6px 16px;margin-top:12px;float:right"
+      onclick="runScanData();this.closest('.ovl').remove()">⬇ 立即更新数据</button>
+    <div style="clear:both"></div>`;
 }
 
 // ================= 策略模板卡片（P0） =================

@@ -35,16 +35,14 @@ def _parquet_last_date(path: Path) -> pd.Timestamp:
     return pd.Timestamp(frame.index[-1])
 
 
-def summarize_daily_cache(daily_dir: Path) -> dict:
-    """Report freshness across every stock cache, using Parquet metadata."""
+def select_latest_files(daily_dir: Path) -> dict[str, Path]:
+    """每只股票选出一个代表缓存文件（按数据最后日期，而非 mtime）。"""
     by_symbol: dict[str, list[Path]] = {}
     for path in daily_dir.glob("*.parquet") if daily_dir.exists() else []:
         if path.name.startswith("index_"):
             continue
         by_symbol.setdefault(path.stem.split("_")[0], []).append(path)
 
-    # 同一票可能有多个来源文件（HiThink/akshare 残留、不同起始年标签）。
-    # 必须按「数据最后日期」取最新的那个，按 mtime 选会把最新数据判成过期。
     selected: dict[str, Path] = {}
     for symbol, paths in by_symbol.items():
         if len(paths) == 1:
@@ -54,6 +52,47 @@ def summarize_daily_cache(daily_dir: Path) -> dict:
             selected[symbol] = max(paths, key=_parquet_last_date)
         except Exception:
             selected[symbol] = max(paths, key=lambda p: p.stat().st_mtime_ns)
+    return selected
+
+
+def daily_cache_detail(daily_dir: Path, stale_days: int = 30) -> dict:
+    """逐票明细：未同步/长期停牌各是哪些票、落后多少天。
+
+    供前端"数据状态详情"弹窗使用——让用户看到具体是谁、可能是什么原因，
+    而不是对着一个未同步数字焦虑。
+    """
+    summary = summarize_daily_cache(daily_dir)
+    if not summary.get("ready"):
+        return {**summary, "stale": [], "suspended": []}
+    selected = select_latest_files(daily_dir)
+    last_date = summary["last_date"]
+
+    stale: list[dict] = []
+    suspended: list[dict] = []
+    for symbol, path in selected.items():
+        try:
+            date_str = _parquet_last_date(path).strftime("%Y-%m-%d")
+        except Exception:
+            stale.append({"symbol": symbol, "last_date": "不可读",
+                          "gap_days": 9999})
+            continue
+        if date_str == last_date:
+            continue
+        gap = (pd.Timestamp(last_date) - pd.Timestamp(date_str)).days
+        item = {"symbol": symbol, "last_date": date_str, "gap_days": gap}
+        (stale if gap <= stale_days else suspended).append(item)
+
+    def _key(x):
+        return (-x["gap_days"], x["symbol"])
+
+    return {**summary,
+            "stale": sorted(stale, key=_key)[:300],
+            "suspended": sorted(suspended, key=_key)[:300]}
+
+
+def summarize_daily_cache(daily_dir: Path) -> dict:
+    """Report freshness across every stock cache, using Parquet metadata."""
+    selected = select_latest_files(daily_dir)
 
     dates: dict[str, str] = {}
     invalid = 0
