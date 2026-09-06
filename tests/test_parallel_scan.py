@@ -86,3 +86,28 @@ def test_parallel_scan_matches_serial(tmp_path, monkeypatch):
     assert meta["coverage_known"] is True
     assert meta["accounted_symbols"] == len(syms)
     assert meta["candidate_count"] == len(parallel)
+
+
+def test_run_cancelled_between_phases(tmp_path, monkeypatch):
+    """协作式取消：阶段边界触发 should_cancel 时抛 JobCancelled，
+    不产出候选文件（已完成的数据写入保持有效）。"""
+    import pytest
+    syms, idx = _make_universe(tmp_path)
+    monkeypatch.setenv("SPS_SCAN_WORKERS", "0")
+
+    def fake_batch(*_a, **_k):
+        return {s_: pd.read_parquet(tmp_path / "daily" / f"{s_}_20190101_latest.parquet")
+                for s_ in syms}
+
+    import sps.data as data_module
+    monkeypatch.setattr(data_module, "batch_get_daily", fake_batch)
+    monkeypatch.setattr(data_module, "hithink_available", lambda: False)
+    monkeypatch.setattr(run_scan, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(run_scan, "OUT_DIR", tmp_path / "runs")
+    monkeypatch.setattr(run_scan, "get_index", lambda *a, **k: pd.DataFrame(
+        {"C": np.linspace(3000, 3500, len(idx))}, index=idx))
+
+    with pytest.raises(run_scan.JobCancelled):
+        run_scan.run(list(syms), kind_map={s_: "stock" for s_ in syms},
+                     should_cancel=lambda: True)
+    assert not (tmp_path / "runs" / "candidates.json").exists()

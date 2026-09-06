@@ -35,6 +35,10 @@ OUT_DIR = DATA_DIR / "runs"
 _G: dict = {}
 
 
+class JobCancelled(Exception):
+    """用户请求停止任务：在安全边界退出，不产生半成品文件。"""
+
+
 def dedup_events(events: list["dict"], df: pd.DataFrame,
                  window_days: int = 20) -> list[dict]:
     """同股票同标签在 window 个交易日内只保留首次事件（规格书四.6）。"""
@@ -195,7 +199,14 @@ def _scan_workers() -> int:
 def run(symbols: list[str], start: str = "20190101",
         recent_days: int | None = None,
         kind_map: dict[str, str] | None = None,
-        data_only: bool = False):
+        data_only: bool = False,
+        should_cancel=None):
+    """should_cancel: 无参函数，返回 True 时在最近的安全边界（阶段/
+    分片边界）抛出 JobCancelled——已完成的数据写入保持有效。"""
+    def _check_cancel():
+        if should_cancel is not None and should_cancel():
+            raise JobCancelled()
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     events_all, stat_rows = [], []
     fund_filtered = 0
@@ -230,6 +241,8 @@ def run(symbols: list[str], start: str = "20190101",
         print(f"[完成] 行情数据已更新（{len(daily)}/{total} 只），未跑形态扫描")
         return []
 
+    _check_cancel()   # 数据阶段完成后、重计算开始前的安全退出点
+
     # 基准与牛熊分层（供环境评分用）
     idx = get_index("000300", start="20180101")
     regime = market_regime(idx["C"])
@@ -252,6 +265,9 @@ def run(symbols: list[str], start: str = "20190101",
                          initargs=(regime, kind_map or {}, str(DATA_DIR))) as pool:
                 for evs, srows, cnt, warns in pool.imap_unordered(
                         _detect_shard, shards):
+                    if should_cancel is not None and should_cancel():
+                        pool.terminate()
+                        raise JobCancelled()
                     events_all.extend(evs)
                     stat_rows.extend(srows)
                     fund_filtered += cnt["fund_filtered"]
@@ -277,6 +293,7 @@ def run(symbols: list[str], start: str = "20190101",
 
     if not ran_parallel:
         for i, sym in enumerate(symbols):
+            _check_cancel()
             evs, srows, cnt, warns = _detect_one(
                 sym, daily.get(sym), regime, kind_map)
             events_all.extend(evs)

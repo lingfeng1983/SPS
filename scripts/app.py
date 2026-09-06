@@ -41,19 +41,24 @@ app = Flask(__name__)
 # ---------------------------------------------------------------- 后台任务管理
 
 _job = {"running": False, "log": [], "done": False, "cmd": None,
-        "proc": None, "progress": None}
+        "proc": None, "progress": None, "kind": None, "cancel": False}
 _scan_progress = {"current": 0, "total": 0}
 _screen_task = {"active": False, "done": False, "progress": {"phase": "准备中", "pct": 2}, "result": None, "error": None}
 
 
 def stop_job() -> bool:
-    """终止正在运行的扫描进程。"""
+    """停止当前任务。子进程任务直接终止；进程内任务置取消标记，
+    在最近的安全边界（阶段/分片边界）协作式退出，不产生半成品。"""
+    if not _job["running"]:
+        return False
     p = _job.get("proc")
     if p is not None and p.poll() is None:
         p.kill()
         _job["log"].append("[已手动停止]")
         return True
-    return False
+    _job["cancel"] = True
+    _job["log"].append("[停止请求] 将在安全边界退出（最多等待当前分片完成）…")
+    return True
 
 
 def _run_bg(cmd: list[str]):
@@ -79,13 +84,17 @@ def _run_bg(cmd: list[str]):
         _job["running"] = False
         _job["proc"] = None
         _job["done"] = True
+        _job["cancel"] = False
+        _job["kind"] = None
 
 
-def start_job(cmd: list[str]) -> bool:
+def start_job(cmd: list[str], kind: str | None = None) -> bool:
     if _job["running"]:
         return False
     _job["running"] = True   # 在调用线程内置位，堵住 check-then-act 竞窗
     _job["done"] = False
+    _job["cancel"] = False
+    _job["kind"] = kind
     _job["cmd"] = cmd
     threading.Thread(target=_run_bg, args=(cmd,), daemon=True).start()
     return True
@@ -1312,10 +1321,12 @@ def _is_frozen() -> bool:
 
 
 def _run_scan_inthread(n: int, data_only: bool = False,
-                       note: str | None = None) -> bool:
+                       note: str | None = None, kind: str = "scan") -> bool:
     """打包版：进程内跑扫描（stdout 重定向到任务日志）。data_only=True 只刷行情。
 
     返回 False 表示已有任务在运行（调用方据此提示用户）。
+    支持协作式取消：stop_job() 置 _job["cancel"] 后，任务在最近的安全
+    边界（数据阶段后/分片边界）退出，不产生半成品文件。
     """
     import io
     from contextlib import redirect_stdout
@@ -1323,6 +1334,8 @@ def _run_scan_inthread(n: int, data_only: bool = False,
     if _job["running"]:
         return False
     _job["running"] = True   # 在调用线程内置位，堵住 check-then-act 竞窗
+    _job["cancel"] = False
+    _job["kind"] = kind
 
     class _Log(io.TextIOBase):
         def write(self, s):
@@ -1339,23 +1352,28 @@ def _run_scan_inthread(n: int, data_only: bool = False,
         try:
             with redirect_stdout(_Log()):
                 if getattr(sys, "frozen", False):
-                    from run_scan import run          # PyInstaller 已打包
+                    from run_scan import run, JobCancelled   # PyInstaller 已打包
                 else:
                     sys.path.insert(0, str(ROOT / "scripts"))
-                    from run_scan import run
+                    from run_scan import run, JobCancelled
                 from sps.data import get_all_symbols
                 uni = get_all_symbols(include_etf=False, exclude_st_bj=True)
                 syms = uni["symbol"].tolist()
                 if n > 0:
                     syms = syms[:n]
                 km = dict(zip(uni["symbol"], uni.get("kind", "stock")))
-                run(syms, kind_map=km, data_only=data_only)
+                run(syms, kind_map=km, data_only=data_only,
+                    should_cancel=lambda: bool(_job.get("cancel")))
             _job["log"].append("[完成]")
+        except JobCancelled:
+            _job["log"].append("[已手动停止] 任务在安全边界退出，数据无半成品")
         except Exception as e:  # noqa: BLE001
             _job["log"].append(f"[错误] {e}")
         finally:
             _job["running"] = False
             _job["done"] = True
+            _job["cancel"] = False
+            _job["kind"] = None
 
     threading.Thread(target=worker, daemon=True).start()
     return True
@@ -1367,7 +1385,8 @@ def api_run():
     action = body.get("action", "scan")
     n = int(body.get("max_stocks") or 0)
     if action in ("scan", "update_data") and _is_frozen():
-        ok = _run_scan_inthread(n, data_only=(action == "update_data"))
+        ok = _run_scan_inthread(n, data_only=(action == "update_data"),
+                                kind=action)
         return jsonify({"ok": ok})
     py = str(ROOT / ".venv" / "Scripts" / "python.exe")
     if action == "update_data":
@@ -1417,6 +1436,8 @@ def api_job():
                 break
     return jsonify({"running": _job["running"], "done": _job["done"],
                     "log": _job["log"][-40:], "total_lines": len(_job["log"]),
+                    "kind": _job.get("kind"),
+                    "cancel_requested": bool(_job.get("cancel")),
                     "progress": progress})
 
 
@@ -1579,6 +1600,10 @@ td.val{text-align:right;font-weight:600}
     <button onclick="openAISettings()" style="width:auto;padding:3px 10px;margin:0;margin-left:auto;font-size:11px;background:#33415580">⚙ AI 设置</button>
     <button onclick="openFeedback()" style="width:auto;padding:3px 10px;margin:0;font-size:11px;background:#33415580">💬 反馈</button>
   </div>
+  <div id="jobBanner" style="display:none;align-items:center;gap:10px;background:#2a230d;border:1px solid var(--amber);border-radius:10px;padding:9px 14px;margin-bottom:10px;font-size:12.5px">
+    <span id="jobBannerText"></span>
+    <button onclick="stopJob()" style="width:auto;padding:3px 12px;margin:0 0 0 auto;font-size:11px;background:#33415580;flex-shrink:0">⏹ 停止</button>
+  </div>
   <div id="tabbar" style="display:flex;gap:8px;margin-bottom:12px">
     <button onclick="showTab('filter')" id="tab-filter" class="tabbtn on" style="width:auto;padding:7px 18px;margin:0;border-radius:8px;background:var(--accent)">🔍 筛选</button>
     <button onclick="showTab('pos')" id="tab-pos" class="tabbtn" style="width:auto;padding:7px 18px;margin:0;border-radius:8px;background:#33415580">💼 持仓管理</button>
@@ -1632,18 +1657,18 @@ async function runScanData(){
   const r=await fetch('/api/run',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();
-  if(!j.ok) alert('已有任务在运行中');
-  else { setFresh('running'); pollJobFresh(); }
+  if(!j.ok){ await busyHint(); return; }
+  setFresh('running'); pollJobFresh();
 }
 
 async function runDeepScan(){
-  if(!confirm('深度扫描 = 更新数据 + 全市场形态检测 + 重建候选清单。\n\n⏱ 预计 0.5~2 小时（取决于电脑性能），期间请勿关闭程序。\n日常选股只需「⬇ 更新数据」（约3~5分钟）。\n\n现在开始深度扫描吗？')) return;
+  if(!confirm('深度扫描 = 更新数据 + 全市场形态检测 + 重建候选清单。\n\n⏱ 预计 0.5~2 小时（取决于电脑性能），期间界面可能变卡，请勿关闭程序。\n💡 建议在收盘后的空闲时段（如晚上）使用；日常选股只需「⬇ 更新数据」（约3~5分钟）。\n\n现在开始吗？')) return;
   const r=await fetch('/api/run',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({action:'scan', max_stocks:0})});
   const j=await r.json();
-  if(!j.ok) alert('已有任务在运行中');
-  else { setFresh('running'); pollJobFresh(); }
+  if(!j.ok){ await busyHint(); return; }
+  setFresh('running'); pollJobFresh();
 }
 
 // ================= 数据新鲜度 =================
@@ -1690,28 +1715,51 @@ async function checkCandidateMeta(){
     el.style.color='var(--muted)';
   }catch(e){ el.textContent='候选清单状态未知'; }
 }
+const JOB_KIND_CN={scan:'🧭 深度扫描进行中（占用大量CPU，界面可能变卡；请勿关闭程序）',
+                   update_data:'⬇ 数据更新中…'};
 let _freshPoll=null;
 function pollJobFresh(){
   if(_freshPoll) return;
   _freshPoll=setInterval(async()=>{
     try{
       const j=await (await fetch('/api/job')).json();
-      if(!j.running){ clearInterval(_freshPoll); _freshPoll=null; checkFresh(); return; }
+      const banner=document.getElementById('jobBanner');
+      if(!j.running){
+        clearInterval(_freshPoll); _freshPoll=null;
+        if(banner) banner.style.display='none';
+        checkFresh(); return;
+      }
+      let txt=JOB_KIND_CN[j.kind]||'任务执行中…';
+      if(j.cancel_requested) txt+=' · 正在停止（等待安全边界，最多约1分钟）…';
+      else if(j.progress && j.progress.total>0) txt+=` ${j.progress.current}/${j.progress.total} (${j.progress.pct}%)`;
+      if(banner){ banner.style.display='flex';
+        document.getElementById('jobBannerText').textContent=txt; }
       const bar=document.getElementById('freshProgressBar');
-      const txt=document.getElementById('freshProgressText');
+      const txt2=document.getElementById('freshProgressText');
       const prog=j.progress;
       if(prog && prog.total>0){
         bar.style.width=prog.pct+'%';
         bar.style.animation='';
-        if(txt) txt.textContent=`更新数据中… ${prog.current}/${prog.total} (${prog.pct}%)`;
+        if(txt2) txt2.textContent=`更新数据中… ${prog.current}/${prog.total} (${prog.pct}%)`;
       } else {
         bar.style.width='30%';
         bar.style.animation='progPulse 1.4s ease-in-out infinite';
-        if(txt) txt.textContent='更新数据中…';
+        if(txt2) txt2.textContent='更新数据中…';
       }
-      setFresh('running',`更新数据中…`);
+      setFresh('running',`任务执行中…`);
     }catch(e){}
   },1000);
+}
+async function stopJob(){
+  if(!confirm('确定停止当前任务？任务会在安全边界退出（最多约1分钟），已完成的数据写入保留，但本次任务不会跑完。')) return;
+  await fetch('/api/stop',{method:'POST'});
+}
+async function busyHint(){
+  try{
+    const job=await (await fetch('/api/job')).json();
+    const t=JOB_KIND_CN[job.kind]||'其他任务';
+    alert(`当前正在执行：${t.replace(/（.*）/,'')}\n\n请等它完成，或点顶部任务横幅上的「⏹ 停止」后再试。`);
+  }catch(e){ alert('已有任务在运行中'); }
 }
 
 // ================= 策略模板卡片（P0） =================
