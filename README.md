@@ -25,7 +25,7 @@ D:\SPS
 │   ├── 形态识别规则规格书_v1.1.md   # 规则定义（唯一权威来源）
 │   └── 使用说明-用户版.md            # 桌面版用户文档
 ├── sps/                              # 核心包
-│   ├── data.py                       # 数据层：AKShare 拉取 + parquet 缓存
+│   ├── data.py                       # 数据层：HiThink 优先、AKShare 回退 + parquet 缓存
 │   ├── indicators.py                 # Pivot/ATR/RPS/词典
 │   ├── events.py                     # 事件契约（JSON schema）
 │   ├── patterns.py                   # 形态检测器（W_BOTTOM/FLAT_BREAKOUT/CUP_HANDLE/POCKET_PIVOT）
@@ -36,7 +36,8 @@ D:\SPS
 │   ├── screener.py                   # 参数化指标筛选引擎（18 因子）
 │   ├── ai_interpret.py               # 用户 LLM API 解读
 │   ├── resume.py                     # 断点续跑
-│   └── stringify.py                  # 报告序列化
+│   ├── candidates.py                 # 候选结果契约与旧数据兼容迁移
+│   └── health.py                     # 全市场缓存新鲜度检查
 ├── scripts/
 │   ├── app.py                        # Flask Web UI（主程序，含 PyInstaller 打包入口）
 │   ├── run_scan.py                   # 命令行扫描器
@@ -50,7 +51,7 @@ D:\SPS
 │   ├── daily/                        # 日线缓存（~5700 parquet）
 │   ├── meta/                         # 股票列表/行业映射/指数
 │   └── runs/                         # 扫描结果/报告
-├── dist/SPS/                         # PyInstaller 打包产物（git ignored）
+├── release/SPS/                      # 当前 PyInstaller 发布包（git ignored）
 ├── requirements.txt                  # pip freeze 依赖
 ├── SPS.spec                          # PyInstaller 配置
 ├── 启动SPS.bat                       # 一键启动器
@@ -61,21 +62,26 @@ D:\SPS
 
 ## 快速启动
 
-### 方式 A：开发环境（推荐调试用）
+### 方式 A：一键启动（本机使用）
+
+双击 `启动SPS.bat`。启动器会依次寻找项目根目录打包版、`release/SPS/SPS.exe`、旧版 `dist/SPS/SPS.exe`
+和开发环境，并在服务健康后自动打开浏览器。重复双击不会再启动第二个服务。
+
+### 方式 B：开发环境（推荐调试用）
 
 ```bash
 cd D:\SPS
 .venv\Scripts\python.exe scripts\app.py
 # 浏览器访问 http://127.0.0.1:5000
-# 首次使用点击右上角「⬇ 更新数据」下载行情（约 30-60 分钟）
+# 首次使用点击右上角「⬇ 更新数据」下载行情；之后按重叠窗口增量刷新
 ```
 
-### 方式 B：打包 exe（交付用户）
+### 方式 C：打包 exe（交付用户）
 
 ```bash
 cd D:\SPS
-.venv\Scripts\python.exe -m PyInstaller SPS.spec --noconfirm
-# 产物：dist/SPS/SPS.exe（整个 dist/SPS 文件夹拷贝给用户）
+.venv\Scripts\python.exe -m PyInstaller SPS.spec --noconfirm --distpath release
+# 产物：release/SPS/SPS.exe（必须把整个 release/SPS 文件夹拷贝给用户）
 # 用户双击 SPS.exe 即可，数据在 exe 同目录的 data/ 下自动生成
 ```
 
@@ -104,7 +110,7 @@ cd D:\SPS
 - [x] PyInstaller 一键打包（~171MB onedir）
 
 ### 工程化
-- [x] pytest 24/24 通过
+- [x] pytest 单元测试 + 扫描/API/缓存回归测试
 - [x] git 版本控制
 - [x] 依赖锁定（`requirements.txt`）
 - [x] `.gitignore` 清理
@@ -121,6 +127,11 @@ cd D:\SPS
 | 异常不静默 | 形态 `scan` 失败打印 `[warn]` 而非 `continue` |
 | 成本后收益 | 每笔往返扣 0.70%（佣金+印花税+滑点） |
 | 参数哈希落盘 | `params_hash` 写入事件记录 |
+| 止损字段不混用未来结果 | `entry.stops` 固定止损线；`entry.stop_exits` 为回测退出价 |
+| 行情主备链路 | 更新时 HiThink 前复权日线优先，失败标的才回退 AkShare；缓存保留历史并覆盖未收盘旧值 |
+| 每日增量快路径 | 日常更新用 HiThink 全市场快照一次拉最新日K（缓存仅落后一天即合并），替代逐票子进程拉取；缺历史/落后多日的票才走逐票补历史 |
+| 形态检测并行化 | 检测循环多进程分片（默认核数，上限8），结果与单进程逐票一致（有等价性回归测试）；不可用时自动回退单进程 |
+| 前复权拼接防护 | 增量刷新时校验重叠窗口收盘价，偏差 >0.5% 判定复权基准过期 → 该票全量重拉，禁止新旧基准拼接 |
 
 ---
 

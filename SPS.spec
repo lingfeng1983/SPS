@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # SPS 桌面版打包配置：PyInstaller onedir 模式
-# 构建：.venv/Scripts/python.exe -m PyInstaller SPS.spec --noconfirm
-# 产物：dist/SPS/SPS.exe（整个 dist/SPS 文件夹即交付物）
+# 构建：.venv/Scripts/python.exe -m PyInstaller SPS.spec --noconfirm --distpath release
+# 产物：release/SPS/SPS.exe（整个 release/SPS 文件夹即交付物）
 
 import sys
 from pathlib import Path
@@ -33,7 +33,8 @@ a = Analysis(
     hiddenimports=[
         'flask', 'jinja2', 'pandas', 'numpy', 'pyarrow',
         'akshare', 'requests', 'urllib3', 'certifi', 'openpyxl',
-        'akshare.fund.fund_etf_fund_em', 'akshare.stock_feature',
+        'akshare.fund.fund_etf_em', 'akshare.stock_feature',
+        'akshare.stock_feature.stock_hist_em',
     ],
     hookspath=[],
     hooksconfig={},
