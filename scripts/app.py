@@ -1805,8 +1805,12 @@ async function openDataDetail(){
     ${table(j.stale,'stale')}
     <div style="font-size:12.5px;font-weight:700;margin:12px 0 2px">▸ 长期停牌/池外 ${j.suspended.length} 只</div>
     ${table(j.suspended,'suspended')}
-    <button style="width:auto;padding:6px 16px;margin-top:12px;float:right"
-      onclick="runScanData();this.closest('.ovl').remove()">⬇ 立即更新数据</button>
+    <div style="font-size:12px;color:var(--muted);margin-top:10px">
+      以上情况均无需处理：停牌恢复后数据会自动跟上。</div>
+    <div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end">
+      <button style="width:auto;padding:6px 16px" onclick="this.closest('.ovl').remove()">我知道了</button>
+      <button class="green" style="width:auto;padding:6px 16px" onclick="runScanData();this.closest('.ovl').remove()">⬇ 仍要更新数据</button>
+    </div>
     <div style="clear:both"></div>`;
 }
 
