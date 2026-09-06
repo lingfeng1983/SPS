@@ -27,22 +27,25 @@ CDN_PLOTLY = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 
 
 def load_candidates() -> list[dict]:
+    from sps.candidates import load_candidates_file
     p = RUN_DIR / "candidates.json"
-    if not p.exists():
-        return []
-    return json.loads(p.read_text(encoding="utf-8"))
+    return load_candidates_file(p)
 
 
-def candlestick_data(symbol: str) -> pd.DataFrame | None:
-    """从缓存的日线 Parquet 取出 OHLCV（含 date）。"""
-    for f in sorted(DATA_DIR.glob(f"daily/{symbol}_*.parquet"), key=lambda p: p.stat().st_mtime):
+def candlestick_data(symbol: str):
+    """从 Parquet 缓存读取原始 OHLCV + 日期，返回 dict 或 None。
+
+    同一票可能有多个缓存文件（不同起始标签/双源残留），必须按
+    「数据最后日期」选最新的，不能按 mtime——旧残留文件会掩盖新数据。
+    """
+    best = None   # (last_date, mtime_ns, payload)
+    for f in DATA_DIR.glob("daily/" + symbol + "_*.parquet"):
         try:
             df = pd.read_parquet(f)
         except Exception:
             continue
         if df.empty:
             continue
-        # date 可能来自 index 或独立列 — 避免索引/列二义性
         if isinstance(df.index, pd.DatetimeIndex):
             dates = pd.to_datetime(df.index).values
             base = df
@@ -50,16 +53,21 @@ def candlestick_data(symbol: str) -> pd.DataFrame | None:
             if "date" not in df.columns:
                 continue
             dates = pd.to_datetime(df["date"]).values
-            base = df.drop(columns=[col for col in df.columns if col.lower() == "date"])
+            base = df.drop(columns=[c for c in df.columns if c.lower() == "date"])
         need = ["O", "H", "L", "C", "V"]
         if not set(need).issubset(base.columns):
             continue
         n = min(len(dates), *(len(base[c]) for c in need))
-        dates = dates[:n].tolist()
-        out = {col: base[col].tolist()[:n] for col in need}
-        return {"dates": dates, "O": out["O"], "H": out["H"], "L": out["L"], "C": out["C"], "V": out["V"]}
-    return None
-
+        if n == 0:
+            continue
+        payload = {"dates": pd.to_datetime(dates[:n]).tolist(),
+            "O": base["O"].tolist()[:n], "H": base["H"].tolist()[:n],
+            "L": base["L"].tolist()[:n], "C": base["C"].tolist()[:n],
+            "V": base["V"].tolist()[:n]}
+        key = (dates[n - 1], f.stat().st_mtime_ns)
+        if best is None or key > best[0]:
+            best = (key, payload)
+    return best[1] if best else None
 
 def fmt_price(v) -> str:
     if v is None:

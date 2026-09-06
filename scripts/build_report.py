@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from sps.candidates import load_candidates_file
 
 RUN_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
 
@@ -14,8 +19,7 @@ def build_report(out: Path | None = None) -> Path:
         if ev_path.exists() else []
 
     cand_path = RUN_DIR / "candidates.json"
-    cands = json.loads(cand_path.read_text(encoding="utf-8")) \
-        if cand_path.exists() else []
+    cands = load_candidates_file(cand_path)
 
     # 候选清单卡片
     cards = ""

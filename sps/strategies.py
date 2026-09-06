@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import json
 from datetime import date
-from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
-STRAT_FILE = DATA_DIR / "my_strategies.json"
+from sps.paths import DATA_DIR
+
+STRAT_FILE = DATA_DIR / "runs" / "my_strategies.json"
 
 
 def _load() -> list[dict]:

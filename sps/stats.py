@@ -49,9 +49,20 @@ def forward_stats(df: pd.DataFrame, entry_pos: int, A: float,
     return res
 
 
+def stop_prices(A: float, levels=(-0.05, -0.07, -0.10)) -> dict:
+    """返回进场时即可确定的固定止损价，不混入未来退出结果。"""
+    return {lv: A * (1 + lv) for lv in levels}
+
+
 def stop_loss_sim(df: pd.DataFrame, entry_pos: int, A: float,
                   levels=(-0.05, -0.07, -0.10)) -> dict:
-    """三档止损模拟：盘中触发按止损价，开盘跳空低过止损价按开盘价。"""
+    """兼容旧调用；新代码应使用语义明确的 :func:`stop_prices`。"""
+    return stop_prices(A, levels)
+
+
+def stop_exit_sim(df: pd.DataFrame, entry_pos: int, A: float,
+                  levels=(-0.05, -0.07, -0.10)) -> dict:
+    """模拟各档止损的实际退出价；未触发时返回样本末日收盘价。"""
     out = {lv: None for lv in levels}
     n = len(df)
     for lv in levels:

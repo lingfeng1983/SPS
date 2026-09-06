@@ -14,17 +14,17 @@
     time_stop   : 持有超过 N 日仍亏损（默认20日）
 - 规则参数均有 valid_range，超出在后端校验拒绝。
 
-回测口径与买入侧一致：信号 t 收盘确认 → t+1 开盘评估执行。
+回测口径：入场 t 收盘确认 → t+1 开盘进场；退出以确认日收盘价近似（保守）。
 """
 from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from sps.paths import DATA_DIR
+
 POS_FILE = DATA_DIR / "positions.json"
 
 # 卖出规则定义：label / 默认参数 / 有效区间 / 说明
@@ -100,7 +100,10 @@ def validate_rules(rules: dict) -> tuple[dict, list[str]]:
 # ---------------------------------------------------------------- 持仓 CRUD
 
 def add_position(symbol: str, name: str, entry_price: float, entry_date: str,
-                 stop_pct: float, rules: dict, qty: float | None = None) -> dict:
+                 stop_pct: float, rules: dict, qty: float | None = None,
+                 mode: str = "paper") -> dict:
+    if mode not in ("paper", "live"):
+        raise ValueError(f"未知持仓模式: {mode}")
     recs = load_positions()
     # 同一票若已有 open 持仓则拒绝（简化：不摊平）
     for r in recs:
@@ -113,6 +116,7 @@ def add_position(symbol: str, name: str, entry_price: float, entry_date: str,
         "stop_pct": float(stop_pct),
         "stop_price": round(float(entry_price) * (1 - float(stop_pct) / 100), 3),
         "rules": rules, "qty": qty,
+        "mode": mode,   # paper=模拟仓 / live=实盘仓
         "status": "open",
         "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -311,32 +315,34 @@ def backtest_exit_rules(daily: dict[str, pd.DataFrame],
             for i in range(entry_pos, len(df)):
                 price = float(c[i])
                 held_peak = max(held_peak, price)
-                hit = None
+                # 各规则并列检查（任一触发即退出）；同日多规则触发时
+                # 按保命优先级取一：止损 > 破线 > 动量 > 止盈 > 时间
+                hits = []
                 if "stop_loss" in rules and price <= stop:
-                    hit = ("stop_loss", price)
-                elif "break_ma" in rules:
+                    hits.append(("stop_loss", price))
+                if "break_ma" in rules:
                     p = int(rules["break_ma"])
                     if i >= entry_pos + p:
                         ma = float(df["C"].iloc[i - p + 1:i + 1].mean())
                         if price < ma:
-                            hit = ("break_ma", price)
-                elif "mom_reverse" in rules:
+                            hits.append(("break_ma", price))
+                if "mom_reverse" in rules:
                     p = int(rules["mom_reverse"])
                     j = i - p
                     if j >= entry_pos and j < len(c):
                         if price / float(c[j]) - 1 < 0:
-                            hit = ("mom_reverse", price)
-                elif "trail_stop" in rules:
+                            hits.append(("mom_reverse", price))
+                if "trail_stop" in rules:
                     p = float(rules["trail_stop"])
                     if held_peak > entry and price / held_peak - 1 <= -p / 100:
-                        hit = ("trail_stop", price)
-                elif "time_stop" in rules:
+                        hits.append(("trail_stop", price))
+                if "time_stop" in rules:
                     p = int(rules["time_stop"])
                     if i - entry_pos >= p and price / entry - 1 <= 0:
-                        hit = ("time_stop", price)
+                        hits.append(("time_stop", price))
                 # 无论是否触发：最后一日强制平仓（open trade 计浮动）
-                if hit:
-                    exit_pos, reason = i, hit[0]
+                if hits:
+                    exit_pos, reason = i, hits[0][0]
                     break
                 if i == len(df) - 1:
                     exit_pos, reason = i, "eod"
@@ -361,3 +367,62 @@ def backtest_exit_rules(daily: dict[str, pd.DataFrame],
             "avg_hold_days": int(np.mean(holds)),
             "per_rule_counts": per_rule,
             "cost_model": f"佣金{COMMISSION_RATE*1e4:.0f}万双边+印花税{STAMP_TAX*1e3:.1f}千+滑点{SLIPPAGE*1e3:.0f}千" if cost else "无"}
+
+
+# ---------------------------------------------------------------- 模拟盘复盘
+
+def paper_record_count() -> int:
+    """模拟仓记录总数（开仓+已平仓），用于新手模式门槛。
+
+    mode 字段引入前的存量记录一律视为模拟——与升级前的实际使用方式一致，
+    避免老用户的模拟跟踪史被误标成实盘、并被新手门槛卡住。
+    """
+    return sum(1 for r in load_positions() if r.get("mode", "paper") == "paper")
+
+
+def review_report(days: int = 30) -> dict:
+    """模拟盘复盘：统计近 N 天平仓的模拟仓成绩与在持清单。
+
+    这是"教练模式"的核心输出——用真实跟踪记录回答
+    "跟着系统模拟操作一段时间后，成绩到底如何"。
+    """
+    recs = [r for r in load_positions() if r.get("mode", "paper") == "paper"]
+    now = time.time()
+
+    def _within(d: str) -> bool:
+        try:
+            t = time.mktime(time.strptime((d or "")[:10], "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            return False
+        return now - t <= days * 86400
+
+    closed = [r for r in recs if r["status"] == "closed" and _within(r.get("exit_date", ""))]
+    open_recs = [r for r in recs if r["status"] == "open"]
+    out = {"days": days, "n_closed": len(closed), "n_open": len(open_recs),
+           "n_total": len(recs)}
+    if closed:
+        pnls = [float(r.get("pnl_pct") or 0.0) for r in closed]
+        reasons: dict[str, int] = {}
+        holds = []
+        for r in closed:
+            reasons[r.get("exit_reason", "manual")] = \
+                reasons.get(r.get("exit_reason", "manual"), 0) + 1
+            try:
+                d1 = time.strptime(r["entry_date"][:10], "%Y-%m-%d")
+                d2 = time.strptime(r["exit_date"][:10], "%Y-%m-%d")
+                holds.append(max(0.0, (time.mktime(d2) - time.mktime(d1)) / 86400))
+            except (ValueError, TypeError):
+                pass
+        out.update({
+            "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls) * 100, 1),
+            "avg_pnl": round(sum(pnls) / len(pnls), 2),
+            "best": round(max(pnls), 2),
+            "worst": round(min(pnls), 2),
+            "avg_hold_days": round(sum(holds) / len(holds)) if holds else None,
+            "exit_reasons": reasons,
+        })
+    out["open_positions"] = [
+        {"symbol": r["symbol"], "name": r.get("name", ""),
+         "entry_date": r["entry_date"], "entry_price": r["entry_price"]}
+        for r in open_recs]
+    return out

@@ -60,23 +60,25 @@ def load_symbol_names() -> dict[str, str]:
 
 
 def load_candidates() -> list[dict]:
+    from sps.candidates import load_candidates_file
     p = RUN_DIR / "candidates.json"
-    if not p.exists():
-        return []
-    return json.loads(p.read_text(encoding="utf-8"))
+    return load_candidates_file(p)
 
 
-def candlestick_raw(symbol: str) -> dict | None:
-    """从 Parquet 缓存读取原始 OHLCV + 日期，返回 dict 或 None。"""
-    for f in sorted(DATA_DIR.glob(f"daily/{symbol}_*.parquet"),
-                   key=lambda p: p.stat().st_mtime):
+def candlestick_raw(symbol: str):
+    """从 Parquet 缓存读取原始 OHLCV + 日期，返回 dict 或 None。
+
+    同一票可能有多个缓存文件（不同起始标签/双源残留），必须按
+    「数据最后日期」选最新的，不能按 mtime——旧残留文件会掩盖新数据。
+    """
+    best = None   # (last_date, mtime_ns, payload)
+    for f in DATA_DIR.glob("daily/" + symbol + "_*.parquet"):
         try:
             df = pd.read_parquet(f)
         except Exception:
             continue
         if df.empty:
             continue
-        # date 优先处理为 index，如有独立 date 列则覆盖
         if isinstance(df.index, pd.DatetimeIndex):
             dates = pd.to_datetime(df.index).values
             base = df
@@ -84,23 +86,21 @@ def candlestick_raw(symbol: str) -> dict | None:
             if "date" not in df.columns:
                 continue
             dates = pd.to_datetime(df["date"]).values
-            # 扔掉所有名为 date 的列（不区分大小写）
-            drop_cols = [c for c in df.columns if c.lower() == "date"]
-            base = df.drop(columns=drop_cols)
+            base = df.drop(columns=[c for c in df.columns if c.lower() == "date"])
         need = ["O", "H", "L", "C", "V"]
         if not set(need).issubset(base.columns):
             continue
         n = min(len(dates), *(len(base[c]) for c in need))
-        return {
-            "dates": pd.to_datetime(dates[:n]).tolist(),
-            "O": base["O"].tolist()[:n],
-            "H": base["H"].tolist()[:n],
-            "L": base["L"].tolist()[:n],
-            "C": base["C"].tolist()[:n],
-            "V": base["V"].tolist()[:n],
-        }
-    return None
-
+        if n == 0:
+            continue
+        payload = {"dates": pd.to_datetime(dates[:n]).tolist(),
+            "O": base["O"].tolist()[:n], "H": base["H"].tolist()[:n],
+            "L": base["L"].tolist()[:n], "C": base["C"].tolist()[:n],
+            "V": base["V"].tolist()[:n]}
+        key = (dates[n - 1], f.stat().st_mtime_ns)
+        if best is None or key > best[0]:
+            best = (key, payload)
+    return best[1] if best else None
 
 def fmt_price(v) -> str:
     if v is None:

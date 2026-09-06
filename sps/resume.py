@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from sps.paths import DATA_DIR
+
 LOG_PATH = DATA_DIR / "runs" / "scan_failures.json"
 
 _FAILED_SKIP = {"already_done", "filtered_financial"}
@@ -13,8 +13,7 @@ _FAILED_SKIP = {"already_done", "filtered_financial"}
 
 def record_push(failed_key: str, reason: str) -> None:
     """将 symbol 推入下次续跑队列（失败/跳过）。"""
-    from pathlib import Path
-    p = Path(__file__).resolve().parent.parent / "data" / "runs" / "scan_failures.json"
+    p = LOG_PATH
     p.parent.mkdir(parents=True, exist_ok=True)
     data = {}
     if p.exists():

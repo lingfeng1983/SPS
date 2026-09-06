@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from sps.paths import DATA_DIR
+
 IND_FILE = DATA_DIR / "meta" / "industry_map.json"
 
 
@@ -30,7 +30,9 @@ def get_industry_map(refresh: bool = False) -> dict[str, str]:
     warnings.filterwarnings("ignore")
     try:
         import akshare as ak
-        df = ak.stock_classify_sina()
+        from sps.data import no_proxy
+        with no_proxy():
+            df = ak.stock_classify_sina()
         mapping = {str(r["code"]).zfill(6): str(r["class"])
                    for _, r in df.iterrows()
                    if r.get("class") and str(r["class"]) != "nan"}

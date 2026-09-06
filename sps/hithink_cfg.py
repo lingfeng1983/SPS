@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import date, timedelta
 from pathlib import Path
 
 from sps.data import DATA_DIR
@@ -88,8 +89,13 @@ def test_hithink(api_key: str = "") -> dict:
     try:
         import time as _t
         t0 = _t.time()
+        from sps.data import _timestamp_ms
+        today = date.today()
         result = subprocess.run(
-            "hithink-finance market history --thscode 000001.SZ --format json",
+            ["hithink-finance", "market", "history", "--thscode", "000001.SZ",
+             "--start-ms", _timestamp_ms((today - timedelta(days=7)).strftime("%Y%m%d")),
+             "--end-ms", _timestamp_ms(today.strftime("%Y%m%d")),
+             "--adjust", "forward", "--format", "json"],
             capture_output=True, text=True, timeout=30, check=False,
             shell=True,
         )

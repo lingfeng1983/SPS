@@ -4,9 +4,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import sps.positions as positions_mod
 from sps.positions import backtest_exit_rules, add_position, close_position, load_positions, save_positions
 
 IDX = pd.bdate_range("2024-01-01", periods=200)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_positions_file(tmp_path, monkeypatch):
+    """所有持仓测试写入临时目录，绝不触碰真实 data/positions.json。"""
+    monkeypatch.setattr(positions_mod, "POS_FILE", tmp_path / "positions.json")
 
 
 def make_df(seed=7, drift=0.004, vol_noise=0.012, base=10.0, n=200):
@@ -57,10 +64,41 @@ def test_backtest_exit_rules_per_rule_counts():
         assert any(v > 0 for v in result["per_rule_counts"].values())
 
 
+def test_backtest_exit_rules_multi_rule_parallel():
+    """回归：多规则组合必须并列生效。
+
+    场景：入场后快速拉升至 20，随后 4 根K线内急跌 5.5% 后横盘。
+    - trail_stop(5%) 在 day 94 触发（跌破持有期最高 20 的 5%）；
+    - break_ma(60) 全程不触发（价格始终在 MA60 上方）；
+    - mom_reverse(20) 全程不触发（横盘段动量为 0，下跌段价格仍高于 20 日前）。
+    旧实现的 elif 链里 break_ma 分支短路了 trail_stop，trail 退出数会为 0。
+    """
+    n = 200
+    c = np.empty(n)
+    c[:60] = np.linspace(10, 12, 60)      # 缓涨铺垫历史
+    c[60:92] = np.linspace(12, 20, 32)    # 入场后拉升
+    c[92:96] = np.linspace(20, 18.9, 4)    # 急跌 5.5% → 触发 trail_stop
+    c[96:] = np.linspace(18.9, 19.4, n - 96)   # 缓慢修复，不再触发任何规则
+    df = pd.DataFrame(
+        {"O": c.copy(), "H": c + 0.1, "L": c - 0.1, "C": c,
+         "V": np.full(n, 1e6)},
+        index=IDX[:n],
+    )
+    result = backtest_exit_rules(
+        {"S1": df},
+        {"break_ma": 60, "mom_reverse": 20, "trail_stop": 5.0},
+        stop_pct=7.0,
+    )
+    assert result["n_trades"] > 0
+    assert result["per_rule_counts"]["trail_stop"] >= 1, (
+        "trail_stop 应独立于 break_ma 生效（elif 链回归）"
+    )
+    assert result["per_rule_counts"]["break_ma"] == 0
+    assert result["per_rule_counts"]["mom_reverse"] == 0
+
+
 def test_add_and_load_positions():
     """添加持仓后能正确加载。"""
-    # 清空
-    save_positions([])
     add_position("600519", "贵州茅台", 1600.0, "2024-01-15", stop_pct=7.0, rules={"stop_loss": True}, qty=100)
     add_position("300750", "宁德时代", 180.0, "2024-02-01", stop_pct=7.0, rules={}, qty=500)
     positions = load_positions()
@@ -68,13 +106,17 @@ def test_add_and_load_positions():
     syms = {p["symbol"] for p in positions}
     assert "600519" in syms
     assert "300750" in syms
-    # 清理
-    save_positions([])
+
+
+def test_add_position_rejects_duplicate_open():
+    """同一票不允许重复开仓。"""
+    add_position("600519", "贵州茅台", 1600.0, "2024-01-15", stop_pct=7.0, rules={})
+    with pytest.raises(ValueError):
+        add_position("600519", "贵州茅台", 1650.0, "2024-02-15", stop_pct=7.0, rules={})
 
 
 def test_close_position():
     """平仓后持仓应从 open 移除。"""
-    save_positions([])
     add_position("600519", "贵州茅台", 1600.0, "2024-01-15", stop_pct=7.0, rules={}, qty=100)
     close_position("600519", 1700.0, "2024-03-01")
     positions = load_positions()
@@ -85,5 +127,3 @@ def test_close_position():
     assert len(positions) == 1
     assert positions[0]["status"] == "closed"
     assert positions[0]["exit_price"] == 1700.0
-    # 清理
-    save_positions([])

@@ -1,7 +1,7 @@
 """基本面红线过滤（E阶段，规格书"第一关"）。
 
 数据源：东财个股财务指标接口（ak.stock_financial_abstract_ths / stock_a_indicator_lg）
-免费可得，按股票缓存 parquet。红线一票否决，不参与打分。
+免费可得，按股票缓存 json（TTL 14 天，财报按季更新足够）。红线一票否决，不参与打分。
 
 红线（V1 简化版，全部基于公开报表字段）：
   R1 上市不足 120 个交易日
@@ -13,13 +13,73 @@
 """
 from __future__ import annotations
 
+import json
 import time
-from pathlib import Path
 
 import pandas as pd
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+from sps.paths import DATA_DIR
+
 FUND_DIR = DATA_DIR / "fundamental"
+
+FUND_TTL_DAYS = 14   # 快照有效期；错误快照（_error）视为无效允许重试
+
+
+FUNDAMENTAL_CHECKS = (
+    ("profit_yoy", lambda value: value > 0),
+    ("revenue_yoy", lambda value: value > 0),
+    ("roe", lambda value: value >= 10),
+    ("gross_margin", lambda value: value >= 20),
+    ("debt_ratio", lambda value: value <= 70),
+)
+
+
+def summarize_fundamental_health(fundamental: dict | None) -> dict:
+    """Return the five-check health summary shown in the stock detail view."""
+    snapshot = fundamental or {}
+    known_checks = [
+        (key, predicate) for key, predicate in FUNDAMENTAL_CHECKS
+        if snapshot.get(key) is not None
+    ]
+    passed = sum(
+        bool(predicate(snapshot[key])) for key, predicate in known_checks
+    )
+    known = len(known_checks)
+    ratio = round(passed / known, 4) if known else 0.0
+    grade = "未知" if not known else ("优秀" if passed >= 4 else
+                                    "良好" if passed >= 3 else "偏弱")
+    return {
+        "passed": passed,
+        "known": known,
+        "total": len(FUNDAMENTAL_CHECKS),
+        "ratio": ratio,
+        "grade": grade,
+    }
+
+
+def rank_triggered_by_fundamentals(records: list[dict], loader) -> list[dict]:
+    """Attach health summaries and rank triggered records best-to-worst."""
+    ranked = []
+    for record in records:
+        item = dict(record)
+        try:
+            snapshot = loader(item["symbol"]) or {}
+        except Exception:
+            snapshot = {}
+        item["fundamental_health"] = summarize_fundamental_health(snapshot)
+        ranked.append(item)
+
+    def sort_key(item):
+        health = item["fundamental_health"]
+        has_data = 1 if health["known"] else 0
+        return (
+            has_data,
+            health["ratio"],
+            health["known"],
+            item.get("score") or 0,
+        )
+
+    return sorted(ranked, key=sort_key, reverse=True)
 
 
 def _ensure():
@@ -43,17 +103,35 @@ def _parse_num(v) -> float | None:
         return None
 
 
+def _read_cache(f) -> dict | None:
+    """读缓存快照；过期/损坏/错误快照返回 None（允许重拉）。"""
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "_error" in data:
+        return None
+    try:
+        if time.time() - f.stat().st_mtime > FUND_TTL_DAYS * 86400:
+            return None
+    except OSError:
+        return None
+    return data
+
+
 def get_fundamental(symbol: str) -> dict | None:
     """拉取单只股票的关键基本面快照。失败返回 {}（放行并打标 unknown）。"""
     _ensure()
     f = FUND_DIR / f"{symbol}.json"
-    if f.exists():
-        import json
-        return json.loads(f.read_text(encoding="utf-8"))
+    cached = _read_cache(f)
+    if cached is not None:
+        return cached
     import akshare as ak
     out = {}
     try:
-        fa = ak.stock_financial_abstract_ths(symbol=symbol, indicator="按报告期")
+        from sps.data import no_proxy
+        with no_proxy():
+            fa = ak.stock_financial_abstract_ths(symbol=symbol, indicator="按报告期")
         if fa is not None and not fa.empty:
             row = fa.iloc[-1]   # 升序 → 最后一行是最新报告期
             out["report_date"] = str(row.get("报告期", ""))
@@ -67,8 +145,13 @@ def get_fundamental(symbol: str) -> dict | None:
             # 扣非净利润（用于 R3 更严格判定）
             out["deduct_np"] = _parse_num(row.get("扣非净利润"))
     except Exception as e:  # noqa: BLE001
-        out.setdefault("_error", str(e)[:80])
-    import json
+        # 拉取失败：优先回退旧快照（旧数据也比没有强），否则只标错误不落盘
+        if f.exists():
+            try:
+                return json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        return {"_error": str(e)[:80]}
     f.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     time.sleep(0.4)   # 温和限速
     return out

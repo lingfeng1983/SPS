@@ -12,11 +12,15 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 import threading
 import time
-from datetime import date
+import urllib.request
+import webbrowser
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -26,7 +30,7 @@ if getattr(sys, "frozen", False):   # PyInstaller: 数据/模块解包目录
 from flask import Flask, jsonify, render_template_string, request
 
 from sps.data import DATA_DIR
-from sps.fundamental import get_fundamental
+from sps.fundamental import get_fundamental, rank_triggered_by_fundamentals
 
 ROOT = Path(__file__).resolve().parent.parent
 RUN_DIR = DATA_DIR / "runs"
@@ -80,6 +84,8 @@ def _run_bg(cmd: list[str]):
 def start_job(cmd: list[str]) -> bool:
     if _job["running"]:
         return False
+    _job["running"] = True   # 在调用线程内置位，堵住 check-then-act 竞窗
+    _job["done"] = False
     _job["cmd"] = cmd
     threading.Thread(target=_run_bg, args=(cmd,), daemon=True).start()
     return True
@@ -89,10 +95,15 @@ def start_job(cmd: list[str]) -> bool:
 
 
 def load_candidates() -> list[dict]:
+    from sps.candidates import load_candidates_file
     p = RUN_DIR / "candidates.json"
-    if not p.exists():
-        return []
-    return json.loads(p.read_text(encoding="utf-8"))
+    return load_candidates_file(p)
+
+
+def load_candidates_meta(cands: list[dict]) -> dict:
+    source = RUN_DIR / "candidates.json"
+    from sps.candidates import load_candidates_metadata
+    return load_candidates_metadata(source, cands)
 
 
 def symbol_names() -> dict[str, str]:
@@ -108,10 +119,15 @@ def symbol_names() -> dict[str, str]:
 
 
 def candle_raw(symbol: str) -> dict | None:
-    """读K线缓存，返回 {dates,O,H,L,C,V} 或 None。"""
+    """读K线缓存，返回 {dates,O,H,L,C,V} 或 None。
+
+    同一票可能有多个缓存文件（不同起始年标签、HiThink/akshare 双源残留），
+    必须按「数据最后日期」选最新的，绝不能按文件 mtime——残留旧文件的
+    写入时间可能比新数据更晚（或更早），按 mtime 会读到过期K线。
+    """
     import pandas as pd
-    for f in sorted(DATA_DIR.glob(f"daily/{symbol}_*.parquet"),
-                    key=lambda p: p.stat().st_mtime):
+    best = None   # (last_date, mtime_ns, payload)
+    for f in DATA_DIR.glob(f"daily/{symbol}_*.parquet"):
         try:
             df = pd.read_parquet(f)
         except Exception:
@@ -130,9 +146,14 @@ def candle_raw(symbol: str) -> dict | None:
         if not set(need).issubset(base.columns):
             continue
         n = min(len(dates), *(len(base[c]) for c in need))
-        return {"dates": [str(x)[:10] for x in dates[:n]],
-                **{c: base[c].tolist()[:n] for c in need}}
-    return None
+        if n == 0:
+            continue
+        payload = {"dates": [str(x)[:10] for x in dates[:n]],
+                   **{c: base[c].tolist()[:n] for c in need}}
+        key = (dates[n - 1], f.stat().st_mtime_ns)
+        if best is None or key > best[0]:
+            best = (key, payload)
+    return best[1] if best else None
 
 
 def build_plot(symbol: str, ev: dict) -> dict | None:
@@ -165,7 +186,7 @@ def build_plot(symbol: str, ev: dict) -> dict | None:
             "x": sig, "y": float(raw["L"][dates.index(sig)]) * 0.985,
             "xref": "x", "yref": "y", "showarrow": True,
             "arrowhead": 2, "arrowcolor": "#22c55e", "arrowsize": 1.2,
-            "text": "<b>▲触发信号(买)</b>", "font": {"color": "#22c55e", "size": 11},
+            "text": "<b>▲触发信号(收盘确认)</b>", "font": {"color": "#22c55e", "size": 11},
             "ax": 0, "ay": 26})
     ent = (ev.get("entry") or {}).get("date")
     if ent and ent in dates:
@@ -181,7 +202,7 @@ def build_plot(symbol: str, ev: dict) -> dict | None:
         annotations.append({
             "x": dates[0], "y": stop7,
             "xref": "x", "yref": "y", "showarrow": False,
-            "text": "<b>✖失效参考(卖)</b>", "font": {"color": "#ef4444", "size": 11},
+            "text": "<b>✖失效退出参考</b>", "font": {"color": "#ef4444", "size": 11},
             "xanchor": "left", "yanchor": "bottom"})
     # 形态出现区间：紫色矩形框出 pattern_start ~ pattern_end
     ps, pe = ev.get("pattern_start"), ev.get("pattern_end")
@@ -284,25 +305,15 @@ def api_hithink_cfg_test():
 
 @app.route("/api/data_status")
 def api_data_status():
-    """数据新鲜度：最新缓存K线日期与滞后天数。"""
-    import datetime as _dt
-    daily_dir = DATA_DIR / "daily"
-    last = None
-    if daily_dir.exists():
-        files = sorted(daily_dir.glob("*.parquet"), key=lambda f: f.stat().st_mtime, reverse=True)
-        for f in files[:3]:  # 取最近更新的几只看最后一根K线日期
-            try:
-                import pandas as pd
-                df = pd.read_parquet(f)
-                if len(df):
-                    last = max(last, df.index[-1]) if last is not None else df.index[-1]
-            except Exception:
-                continue
-    if last is None:
-        return jsonify({"ready": False})
-    last_date = pd.Timestamp(last).strftime("%Y-%m-%d")
-    age_days = (pd.Timestamp.today().normalize() - pd.Timestamp(last).normalize()).days
-    return jsonify({"ready": True, "last_date": last_date, "age_days": int(age_days)})
+    """数据新鲜度：覆盖全部股票缓存，而不是抽查最近文件。"""
+    from sps.health import summarize_daily_cache
+    return jsonify(summarize_daily_cache(DATA_DIR / "daily"))
+
+
+@app.route("/api/health")
+def api_health():
+    """Stable identity probe used by the repeat-launch guard."""
+    return jsonify({"service": "SPS", "ok": True, "version": "1.1"})
 
 
 @app.route("/api/candidates")
@@ -311,7 +322,16 @@ def api_candidates():
     cands = load_candidates()
     for c in cands:
         c["_name"] = names.get(c.get("symbol", ""), "")
-    return jsonify({"candidates": cands, "names_count": len(names)})
+    meta = load_candidates_meta(cands)
+    # 日常有用的口径：最近 7 天的新信号数（累计总量对使用者无意义）
+    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    meta["recent7"] = sum(1 for c in cands
+                          if (c.get("signal_date") or "") >= cutoff)
+    meta["latest7"] = max((c.get("signal_date") or "" for c in cands
+                           if (c.get("signal_date") or "") >= cutoff),
+                          default="")
+    return jsonify({"candidates": cands, "names_count": len(names),
+                    "meta": meta})
 
 
 # ---------------------------------------------------------------- 参数化筛选 API
@@ -425,6 +445,10 @@ def _do_screen_worker(conds, stop_pct):
         names = symbol_names()
         for rec in out["triggered"] + out["near"]:
             rec["_name"] = names.get(rec["symbol"], "")
+        # 已触发标的按详情页相同的五项基本面体检排序；无数据者垫底。
+        out["triggered"] = rank_triggered_by_fundamentals(
+            out["triggered"], get_fundamental
+        )
         for rec in out["triggered"][:80]:
             df = daily.get(rec["symbol"])
             if df is None:
@@ -523,12 +547,24 @@ def api_screen_result():
 
 # ---------------------------------------------------------------- 持仓管理（卖出侧）
 
-def _load_daily_min():
-    """筛选/诊断共用的日线缓存载入（精简版）。"""
+def _load_daily_min(symbols: list[str] | None = None) -> dict:
+    """筛选/诊断共用的日线缓存载入（精简版）。
+
+    symbols=None 读全市场（回放/回测需要）；传入 symbol 列表则只读
+    这些票——持仓诊断通常只需几只，读全市场 5000+ 文件要一两分钟。
+    """
     import pandas as pd
+    from itertools import chain
     daily = {}
-    for f in DATA_DIR.glob("daily/*.parquet"):
+    if symbols is None:
+        files = DATA_DIR.glob("daily/*.parquet")
+    else:
+        files = chain.from_iterable(
+            DATA_DIR.glob(f"daily/{s}_*.parquet") for s in symbols)
+    for f in files:
         sym = f.stem.split("_")[0]
+        if sym in daily:
+            continue
         try:
             df = pd.read_parquet(f)
             if isinstance(df.index, pd.DatetimeIndex) and {"O","H","L","C","V"} <= set(df.columns):
@@ -600,11 +636,15 @@ def api_positions_replay():
 @app.route("/api/positions", methods=["GET"])
 def api_positions():
     from sps.positions import load_positions, run_diagnosis, EXIT_RULES
-    daily = _load_daily_min()
+    # 只读持仓票的K线（几只 vs 全市场5300+，进 tab 从一两分钟降到毫秒级）
+    open_syms = [r["symbol"] for r in load_positions() if r["status"] == "open"]
+    daily = _load_daily_min(open_syms)
     diag = run_diagnosis(daily)
     names = symbol_names()
+    mode_by_sym = {r["symbol"]: r.get("mode", "live") for r in load_positions()}
     for r in diag["results"]:
         r.setdefault("name", names.get(r["symbol"], ""))
+        r["mode"] = mode_by_sym.get(r["symbol"], "live")
     hist = [r for r in load_positions() if r["status"] == "closed"]
     return jsonify({"diagnosis": diag, "history": hist[-50:],
                     "exit_rules": {k: {kk: vv for kk, vv in v.items()}
@@ -627,7 +667,8 @@ def api_add_position():
             entry_price=float(body["entry_price"]),
             entry_date=str(body.get("entry_date") or date.today()),
             stop_pct=float(body.get("stop_pct") or 7.0),
-            rules=rules, qty=body.get("qty"))
+            rules=rules, qty=body.get("qty"),
+            mode=str(body.get("mode") or "paper"))
         return jsonify(rec)
     except (KeyError, ValueError) as e:
         return jsonify({"error": str(e)}), 400
@@ -795,6 +836,138 @@ def api_replay():
     return jsonify(out)
 
 
+# ---------------------------------------------------------------- 合规 · 设置 · 反馈
+
+DISCLAIMER_VERSION = "v1"
+DISCLAIMER_FILE = DATA_DIR / "meta" / "disclaimer_accepted.json"
+DISCLAIMER_TEXT = (
+    "本系统（SPS）是本地运行的个人研究工具，仅提供基于历史数据的技术面统计与信号参考，"
+    "不构成任何证券投资建议，不代表任何持牌机构观点；开发者不提供荐股服务。"
+    "历史统计（含胜率）不代表未来表现，据此操作产生的一切后果由使用者自行承担。"
+)
+APP_CFG_FILE = DATA_DIR / "meta" / "app_config.json"
+DEFAULT_APP_CFG = {"auto_update_enabled": False, "auto_update_time": "17:30"}
+
+
+def load_app_config() -> dict:
+    try:
+        d = json.loads(APP_CFG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    return {**DEFAULT_APP_CFG, **d}
+
+
+def save_app_config(patch: dict) -> dict:
+    APP_CFG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    merged = {**load_app_config(),
+              **{k: v for k, v in (patch or {}).items() if k in DEFAULT_APP_CFG}}
+    APP_CFG_FILE.write_text(json.dumps(merged, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+    return merged
+
+
+@app.route("/api/disclaimer")
+def api_disclaimer_get():
+    return jsonify({"version": DISCLAIMER_VERSION,
+                    "text": DISCLAIMER_TEXT,
+                    "accepted": _disclaimer_accepted()})
+
+
+def _disclaimer_accepted() -> bool:
+    try:
+        d = json.loads(DISCLAIMER_FILE.read_text(encoding="utf-8"))
+        return d.get("version") == DISCLAIMER_VERSION and bool(d.get("accepted_at"))
+    except Exception:
+        return False
+
+
+@app.route("/api/disclaimer", methods=["POST"])
+def api_disclaimer_accept():
+    DISCLAIMER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DISCLAIMER_FILE.write_text(json.dumps(
+        {"version": DISCLAIMER_VERSION,
+         "accepted_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+        ensure_ascii=False), encoding="utf-8")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/app_config")
+def api_app_cfg_get():
+    return jsonify(load_app_config())
+
+
+@app.route("/api/app_config", methods=["POST"])
+def api_app_cfg_set():
+    return jsonify(save_app_config(request.get_json(force=True) or {}))
+
+
+@app.route("/api/paper_gate")
+def api_paper_gate():
+    """新手模式门槛：模拟记录满 20 笔前，界面以观察措辞为主。"""
+    from sps.positions import paper_record_count
+    n = paper_record_count()
+    return jsonify({"paper_records": n, "novice": n < 20})
+
+
+@app.route("/api/review_report")
+def api_review_report():
+    """模拟盘复盘：近 N 天模拟仓成绩（用户参数 days，默认 30）。"""
+    from sps.positions import review_report
+    try:
+        days = max(7, min(365, int(request.args.get("days") or 30)))
+    except ValueError:
+        days = 30
+    return jsonify(review_report(days))
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """用户反馈：追加写入本地 feedback.log（含数据状态快照，便于排障）。"""
+    from sps.health import summarize_daily_cache
+    body = request.get_json(force=True) or {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "反馈内容不能为空"}), 400
+    entry = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "1.1",
+        "contact": str(body.get("contact") or "")[:100],
+        "text": text[:2000],
+        "data_status": summarize_daily_cache(DATA_DIR / "daily"),
+    }
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RUN_DIR / "feedback.log", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return jsonify({"ok": True,
+                    "saved_to": "data/runs/feedback.log"})
+
+
+# ---------------- 每日自动增量更新（可开关，默认关闭） ----------------
+
+_auto_state = {"last_date": None}
+
+
+def _auto_update_loop():
+    """守护线程：每 30 秒检查一次，到达配置时刻（默认17:30）触发一次全市场增量刷新。"""
+    while True:
+        try:
+            cfg = load_app_config()
+            if cfg.get("auto_update_enabled") and not _job["running"]:
+                hh, mm = str(cfg.get("auto_update_time", "17:30")).split(":")[:2]
+                tmin = int(hh) * 60 + int(mm)
+                lt = time.localtime()
+                cur = lt.tm_hour * 60 + lt.tm_min
+                today = time.strftime("%Y-%m-%d")
+                if tmin <= cur < tmin + 30 and _auto_state["last_date"] != today:
+                    note = (f"[自动更新] {lt.tm_hour:02d}:{lt.tm_min:02d} "
+                            "触发每日数据增量刷新（只刷行情，约3~5分钟）")
+                    if _run_scan_inthread(0, data_only=True, note=note):
+                        _auto_state["last_date"] = today
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] auto update loop: {e}")
+        time.sleep(30)
+
+
 # ---------------------------------------------------------------- 详情页
 
 DETAIL_HTML = r"""<!DOCTYPE html>
@@ -843,27 +1016,29 @@ td.lbl{color:var(--muted)}td.val{text-align:right;font-weight:600}
 <a class="back" href="/">← 返回候选列表</a>
 <h1 id="ttl">加载中…</h1>
 <div class="sub" id="sub"></div>
+<div id="noviceTip" style="display:none;background:#2a230d;border:1px solid var(--amber);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:12.5px">
+  🌱 <b>新手观察模式</b>：模拟记录未满 20 笔。以下点位为历史数据研究参考，建议先在主界面用<b>模拟模式</b>跟踪记录，累计成绩后再做实际参考。</div>
 
 <div class="grid">
   <div class="card">
     <h4>日K线 — 触发信号与失效参考</h4>
     <div id="kchart"></div>
     <div class="legend">
-      <span style="color:#22c55e">▲触发信号(买)</span> 信号日收盘确认，次日开盘进场 &nbsp;
-      <span style="color:#ef4444">✖失效参考(卖)</span> 收盘跌破此红横线=买点逻辑失效，无条件离场 &nbsp;
+      <span style="color:#22c55e">▲触发信号</span> 信号日收盘确认，次日开盘为参考进场位 &nbsp;
+      <span style="color:#ef4444">✖失效退出参考</span> 收盘跌破此红横线=买点逻辑失效的研究信号 &nbsp;
       <span style="color:#8b5cf6">┄ 紫虚线</span> MA20趋势生命线
     </div>
   </div>
   <div>
     <div class="card">
-      <h4>🩺 基本面体检 — 决定是否买入</h4>
+      <h4>🩺 基本面体检 — 研究参考</h4>
       <div id="health" class="health"></div>
       <table id="fmtab"></table>
     </div>
     <div class="card">
-      <h4>💰 买卖点与止损</h4>
+      <h4>💰 参考点位与止损</h4>
       <div class="buybox">
-        <div class="bk"><div class="t">买点(次日开盘)</div><div class="v v-buy" id="bp">-</div></div>
+        <div class="bk"><div class="t">参考买点(次日开盘)</div><div class="v v-buy" id="bp">-</div></div>
         <div class="bk"><div class="t">止损 -7%</div><div class="v v-stop" id="sp7">-</div></div>
         <div class="bk"><div class="t">关键位(重点监控)</div><div class="v" id="kl">-</div></div>
       </div>
@@ -881,7 +1056,7 @@ td.lbl{color:var(--muted)}td.val{text-align:right;font-weight:600}
 </div>
 
 <script>
-const SYM = "{{ symbol }}";
+const SYM = {{ symbol | tojson }};
 const pct = v => v==null?'-':(v>0?'+':'')+v.toFixed(2)+'%';
 
 // 从 URL 取筛选条件（列表跳转时带上）
@@ -890,6 +1065,11 @@ const CONDS = JSON.parse(QS.get("conds")||"{}");
 const STOP_PCT = QS.get("stop_pct")||7;
 
 async function load(){
+  // 新手模式提示（模拟记录<20笔）
+  try{
+    const g = await (await fetch('/api/paper_gate')).json();
+    if(g.novice) document.getElementById('noviceTip').style.display='';
+  }catch(e){}
   const q = "?conds="+encodeURIComponent(JSON.stringify(CONDS))+"&stop_pct="+STOP_PCT;
   const r = await fetch('/api/screen_detail/'+SYM+q);
   if(!r.ok){
@@ -940,8 +1120,8 @@ function renderTrade(t, j){
   const kl = j.key_levels||{};
   const items = [
     kl.ma20!=null && ['MA20均线', kl.ma20, '跌破则趋势转弱'],
-    kl.stop_price!=null && ['止损位', kl.stop_price, '收盘跌破无条件卖出'],
-    kl.entry_price!=null && ['买点(参考)', kl.entry_price, t.pending?'次日开盘附近挂单':'已触发，可进场'],
+    kl.stop_price!=null && ['止损参考位', kl.stop_price, '收盘跌破为退出研究信号'],
+    kl.entry_price!=null && ['参考买点', kl.entry_price, t.pending?'次日开盘附近参考':'已触发，参考进场位'],
   ].filter(Boolean);
   document.getElementById('kl').innerHTML = items.length
     ? items.map(([n,v,tip])=>`<div style="font-size:11px;color:var(--muted);font-weight:400" title="${tip}">${n}</div><div style="font-size:14px">${v}</div>`).join('')
@@ -955,10 +1135,11 @@ function renderTrade(t, j){
 function renderConds(list){
   document.getElementById('sigtab').innerHTML=list.map(c=>{
     const cls=c.ok?'ok':'no';
+    const param=(c.param!=null&&c.param!==true)?` <span style="color:var(--muted);font-weight:400;font-size:10.5px">(参数 ${c.param})</span>`:'';
     const risks=(c.risks||[]).map(r=>`<li>${r}</li>`).join('');
     const watch=(c.watch_points||[]).map(w=>`<li>${w}</li>`).join('');
     const invalid=(c.invalidation||[]).map(i=>`<li>${i}</li>`).join('');
-    return `<tr><td class="lbl"><span class="${cls}">${c.ok?'✓':'✗'}</span> ${c.label}</td>
+    return `<tr><td class="lbl"><span class="${cls}">${c.ok?'✓':'✗'}</span> ${c.label}${param}</td>
       <td class="val ${cls}">${c.ok?'满足':'未满足'}</td>
       <td style="padding:0 8px;vertical-align:top;max-width:320px">
         ${risks?`<div style="font-size:10.5px;color:#fca5a5">⚠ 风险</div><ul style="margin:1px 0 0 14px;font-size:10.5px;color:var(--muted)">${risks}</ul>`:''}
@@ -984,6 +1165,7 @@ function renderHist(hist){
 
 load();
 </script>
+<div style="position:fixed;right:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8;text-align:right">SPS · 本地研究工具 · 所有信号与统计均为历史数据参考，不构成投资建议</div>
 </body>
 </html>
 """
@@ -1040,6 +1222,7 @@ def api_screen_detail(symbol: str):
         except Exception:
             ok = False
         cond_status.append({"name": name, "label": meta["label"], "ok": ok,
+                            "param": param,
                             "risks": meta.get("risks", []),
                             "watch_points": meta.get("watch_points", []),
                             "invalidation": meta.get("invalidation", [])})
@@ -1128,10 +1311,18 @@ def _is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
-def _run_scan_inthread(n: int):
-    """打包版：进程内跑扫描（stdout 重定向到任务日志）。"""
+def _run_scan_inthread(n: int, data_only: bool = False,
+                       note: str | None = None) -> bool:
+    """打包版：进程内跑扫描（stdout 重定向到任务日志）。data_only=True 只刷行情。
+
+    返回 False 表示已有任务在运行（调用方据此提示用户）。
+    """
     import io
     from contextlib import redirect_stdout
+
+    if _job["running"]:
+        return False
+    _job["running"] = True   # 在调用线程内置位，堵住 check-then-act 竞窗
 
     class _Log(io.TextIOBase):
         def write(self, s):
@@ -1141,29 +1332,24 @@ def _run_scan_inthread(n: int):
             return len(s)
 
     def worker():
-        _job["running"] = True
         _job["done"] = False
         _job["log"] = []
+        if note:
+            _job["log"].append(note)
         try:
             with redirect_stdout(_Log()):
                 if getattr(sys, "frozen", False):
                     from run_scan import run          # PyInstaller 已打包
-                    from sps.data import get_all_symbols
-                    uni = get_all_symbols(include_etf=False, exclude_st_bj=True)
-                    syms = uni["symbol"].tolist()
-                    if n > 0:
-                        syms = syms[:n]
-                    km = dict(zip(uni["symbol"], uni.get("kind", "stock")))
                 else:
                     sys.path.insert(0, str(ROOT / "scripts"))
                     from run_scan import run
-                    from sps.data import get_all_symbols
-                    uni = get_all_symbols(include_etf=False, exclude_st_bj=True)
-                    syms = uni["symbol"].tolist()
-                    if n > 0:
-                        syms = syms[:n]
-                    km = dict(zip(uni["symbol"], uni.get("kind", "stock")))
-                run(syms, kind_map=km)
+                from sps.data import get_all_symbols
+                uni = get_all_symbols(include_etf=False, exclude_st_bj=True)
+                syms = uni["symbol"].tolist()
+                if n > 0:
+                    syms = syms[:n]
+                km = dict(zip(uni["symbol"], uni.get("kind", "stock")))
+                run(syms, kind_map=km, data_only=data_only)
             _job["log"].append("[完成]")
         except Exception as e:  # noqa: BLE001
             _job["log"].append(f"[错误] {e}")
@@ -1172,6 +1358,7 @@ def _run_scan_inthread(n: int):
             _job["done"] = True
 
     threading.Thread(target=worker, daemon=True).start()
+    return True
 
 
 @app.route("/api/run", methods=["POST"])
@@ -1179,14 +1366,18 @@ def api_run():
     body = request.get_json(force=True) or {}
     action = body.get("action", "scan")
     n = int(body.get("max_stocks") or 0)
-    if action == "scan" and _is_frozen():
-        if _job["running"]:
-            return jsonify({"ok": False})
-        _run_scan_inthread(n)
-        return jsonify({"ok": True})
+    if action in ("scan", "update_data") and _is_frozen():
+        ok = _run_scan_inthread(n, data_only=(action == "update_data"))
+        return jsonify({"ok": ok})
     py = str(ROOT / ".venv" / "Scripts" / "python.exe")
-    if action == "scan":
-        cmd = [py, str(ROOT / "scripts" / "run_scan.py")]
+    if action == "update_data":
+        # 只刷新行情（快照快路径，通常3~5分钟），不跑2小时的形态检测
+        cmd = [py, "-u", str(ROOT / "scripts" / "run_scan.py"), "--data-only"]
+        if n > 0:
+            cmd += ["--max-stocks", str(n)]
+    elif action == "scan":
+        # -u 关闭 stdout 块缓冲，否则进度条要等缓冲区满才会动
+        cmd = [py, "-u", str(ROOT / "scripts" / "run_scan.py")]
         if n > 0:
             cmd += ["--max-stocks", str(n)]
     elif action == "dashboard":
@@ -1231,6 +1422,10 @@ def api_job():
 
 @app.route("/detail/<symbol>")
 def detail_page(symbol: str):
+    # symbol 只允许股票代码形态，阻断注入进内联 <script> 的自 XSS
+    if not re.fullmatch(r"[0-9A-Za-z]{4,8}(\.(SH|SZ|BJ))?", symbol or ""):
+        from flask import abort
+        abort(404)
     return render_template_string(DETAIL_HTML, symbol=symbol)
 
 
@@ -1280,6 +1475,9 @@ button.gray{background:#33415580}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--green)}
 .dot.busy{background:var(--amber);animation:pulse 1s infinite}
 @keyframes pulse{50%{opacity:.35}}
+/* 弹窗（免责声明/反馈/新手引导） */
+.ovl{position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:999;display:flex;align-items:center;justify-content:center}
+.mcard{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px;max-width:540px;width:92%;max-height:86vh;overflow-y:auto;box-shadow:0 18px 60px rgba(0,0,0,.5)}
 /* 主区 */
 #main{flex:1;overflow-y:auto;padding:14px 18px}
 .cand{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:11px 13px;
@@ -1363,6 +1561,7 @@ td.val{text-align:right;font-weight:600}
 <div id="main">
   <div id="freshBar" style="display:flex;gap:10px;align-items:center;font-size:11.5px;color:var(--muted);margin-bottom:10px;padding:7px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px">
     <span class="dot" id="freshDot"></span><span id="freshText">检查数据新鲜度…</span>
+    <span id="candidateMeta" style="padding-left:8px;border-left:1px solid var(--border)">检查候选清单…</span>
     <div id="freshProgress" style="flex:1;margin-left:8px;max-width:200px">
       <div style="height:6px;background:#1e293b;border-radius:3px;overflow:hidden">
         <div id="freshProgressBar" style="height:100%;width:5%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:3px;transition:width 0.3s"></div>
@@ -1370,7 +1569,15 @@ td.val{text-align:right;font-weight:600}
       <div id="freshProgressText" style="font-size:10.5px;margin-top:2px;color:var(--muted)"></div>
     </div>
     <button onclick="runScanData()" id="freshBtn" style="width:auto;padding:3px 10px;margin:0;font-size:11px;background:#33415580">⬇ 更新数据</button>
+    <button onclick="runDeepScan()" id="deepBtn" title="更新数据 + 全市场形态检测并重建候选清单，约需 0.5~2 小时（取决于电脑性能）。日常选股只需「更新数据」。"
+      style="width:auto;padding:3px 10px;margin:0;font-size:11px;background:#33415580">🧭 深度扫描</button>
+    <label style="display:flex;align-items:center;gap:3px;cursor:pointer" title="开启后每个交易日到达设定时间（默认17:30）自动增量更新数据，无需手动点击">
+      <input type="checkbox" id="autoUpdChk" onchange="saveAutoUpd(this.checked)"> 自动更新
+    </label>
+    <span class="badge b-neutral" style="cursor:help;font-size:10px;flex-shrink:0"
+      title="SPS 是本地研究工具：所有信号与胜率均为历史数据统计参考，不构成投资建议">研究参考 · 非投资建议</span>
     <button onclick="openAISettings()" style="width:auto;padding:3px 10px;margin:0;margin-left:auto;font-size:11px;background:#33415580">⚙ AI 设置</button>
+    <button onclick="openFeedback()" style="width:auto;padding:3px 10px;margin:0;font-size:11px;background:#33415580">💬 反馈</button>
   </div>
   <div id="tabbar" style="display:flex;gap:8px;margin-bottom:12px">
     <button onclick="showTab('filter')" id="tab-filter" class="tabbtn on" style="width:auto;padding:7px 18px;margin:0;border-radius:8px;background:var(--accent)">🔍 筛选</button>
@@ -1414,14 +1621,14 @@ async function runScanData(){
   // 检查数据是否已是最新（今天），若是则提示
   try {
     const j = await (await fetch('/api/data_status')).json();
-    if (j.ready && j.age_days <= 1) {
-      if (!confirm(`数据已是最新（${j.last_date}），暂时不需要更新。\n\n仍要重新拉取所有数据吗？（耗时较长）`)) {
+    if (j.ready && j.age_days <= 1 && (j.stale_symbols||0) === 0) {
+      if (!confirm(`数据已是最新（${j.last_date}），暂时不需要更新。\n\n仍要重新拉取所有数据吗？`)) {
         return;
       }
     }
   } catch(e) {}
-  // 更新数据缓存：拉取全市场日线+财务（供筛选与回测使用）
-  const body={action:'scan', max_stocks:0};
+  // 只刷新行情（快照快路径，通常3~5分钟），不跑形态检测——日常选股用这个
+  const body={action:'update_data', max_stocks:0};
   const r=await fetch('/api/run',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();
@@ -1429,10 +1636,22 @@ async function runScanData(){
   else { setFresh('running'); pollJobFresh(); }
 }
 
+async function runDeepScan(){
+  if(!confirm('深度扫描 = 更新数据 + 全市场形态检测 + 重建候选清单。\n\n⏱ 预计 0.5~2 小时（取决于电脑性能），期间请勿关闭程序。\n日常选股只需「⬇ 更新数据」（约3~5分钟）。\n\n现在开始深度扫描吗？')) return;
+  const r=await fetch('/api/run',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'scan', max_stocks:0})});
+  const j=await r.json();
+  if(!j.ok) alert('已有任务在运行中');
+  else { setFresh('running'); pollJobFresh(); }
+}
+
 // ================= 数据新鲜度 =================
 function setFresh(state, text){
-  const dot=$('freshDot'), t=$('freshText');
+  const bar=$('freshBar'), dot=$('freshDot'), t=$('freshText');
   if(!dot) return;
+  // 数据过期时整条状态栏变黄边框，让"我在看几号的数据"无法被忽略
+  bar.style.borderColor = state==='stale' ? 'var(--amber)' : 'var(--border)';
   dot.className='dot'+(state==='busy'?' busy':'');
   dot.style.background = state==='stale' ? 'var(--amber)' :
                          state==='running' ? 'var(--amber)' : 'var(--green)';
@@ -1443,10 +1662,33 @@ async function checkFresh(){
     const j=await (await fetch('/api/data_status')).json();
     if(!j.ready){ setFresh('stale','数据未就绪，请先点击"更新数据"'); return; }
     const days=j.age_days;
-    if(days<=1) setFresh('ok',`数据截至 ${j.last_date} ✅ 最新（今天）`);
-    else if(days<=4) setFresh('ok',`数据截至 ${j.last_date}（${days} 天前，可能为节假日）`);
-    else setFresh('stale',`⚠️ 数据截至 ${j.last_date}，已落后 ${days} 天，建议更新`);
+    const now=new Date(), mins=now.getHours()*60+now.getMinutes();
+    const inSession=[1,2,3,4,5].includes(now.getDay()) && mins>=9*60+30 && mins<15*60+5;
+    const intraday=inSession?' · 盘中数据，收盘价以15:00后再更新为准':'';
+    const susp=(j.suspended_symbols||0)>0?` · 另有 ${j.suspended_symbols} 只长期停牌`:'';
+    const cover=j.total_symbols ? ` · 覆盖 ${j.current_symbols}/${j.total_symbols}` : '';
+    const sources=j.total_symbols ? ` · HiThink ${j.hithink_cache_symbols||0} / AkShare ${j.akshare_cache_symbols||0}` : '';
+    if((j.stale_symbols||0)>0) setFresh('stale',`⚠️ 数据截至 ${j.last_date}${cover}${sources}，${j.stale_symbols} 只未同步${intraday}`);
+    else if(days<=1) setFresh('ok',`数据截至 ${j.last_date} ✅ 最新${cover}${susp}${sources}${intraday}`);
+    else if(days<=4) setFresh('ok',`数据截至 ${j.last_date}（${days} 天前，可能为节假日）${cover}${susp}${sources}`);
+    else setFresh('stale',`⚠️ 数据截至 ${j.last_date}，已落后 ${days} 天${cover}${sources}，建议更新`);
   }catch(e){ setFresh('ok','数据状态未知'); }
+}
+async function checkCandidateMeta(){
+  const el=$('candidateMeta');
+  if(!el) return;
+  try{
+    const j=await (await fetch('/api/candidates')).json(), m=j.meta||{};
+    const day=(m.generated_at||'').slice(0,10)||'未知日期';
+    el.title='形态候选清单 = 「🧭 深度扫描」记录的历史形态信号（W底/平台突破/杯柄/口袋支点），用于研究与统计；日常选股请用「🔍 筛选」。';
+    if(!m.coverage_known){
+      el.textContent=`⚠ 形态清单 ${day} · 扫描覆盖未知（建议重新深度扫描）`;
+      el.style.color='var(--amber)';
+      return;
+    }
+    el.textContent=`形态清单 ${day} · 最近7天新信号 ${m.recent7??'-'} 条 · 扫描完整 ${m.accounted_symbols||0}/${m.requested_symbols||0} ✓`;
+    el.style.color='var(--muted)';
+  }catch(e){ el.textContent='候选清单状态未知'; }
 }
 let _freshPoll=null;
 function pollJobFresh(){
@@ -1482,7 +1724,7 @@ const TEMPLATES=[
    logic:`<b>核心思想：</b>只买"趋势已经走好、且有真金白银确认"的票。<br><br>
     <b>条件1 · 站上20日线：</b>20日均线约等于一个月的交易成本线，收盘站上去代表过去一个月买入的人平均是赚钱的，抛压小、趋势向上。<br><br>
     <b>条件2 · 量比≥1.5：</b>当日成交量是20日均量的1.5倍以上。价格涨了但没量可能是假突破；放量上涨说明有资金真金白银进场。<br><br>
-    <b>历史依据：</b>全市场回测（5500+只，含手续费），站上20日线20日胜率约46.6%，样本外不衰减。<br><br>
+    <b>历史依据：</b>全市场回测（含手续费）实际成绩：<span class="lv" data-ind="above_ma" data-param="20">载入中…</span>（随机入场口径，非当前条件的实盘预期）。<br><br>
     <b>适合：</b>震荡向上的市场。 <b>不适合：</b>单边下跌市。`,
    exit:'卖出参考：跌破20日线或触发止损价（买点×(1-止损%)）任一即离场。'}},
  {key:'breakout', icon:'🚀', name:'突破追涨', tag:'强势+量', desc:'距52周新高≤10% + 放量确认',
@@ -1494,7 +1736,7 @@ const TEMPLATES=[
     <b>条件1 · 距52周新高≤10%：</b>上方套牢盘已消化，突破后无解套抛压（欧奈尔CANSLIM核心买点）。<br><br>
     <b>条件2 · 站上60日线：</b>确认是上升趋势中的接近新高，而非下跌反抽。<br><br>
     <b>条件3 · 量比≥2：</b>突破必须放巨量，缩量新高大概率假突破。<br><br>
-    <b>⚠️ 诚实提示：</b>A股直接追高胜率仅38-41%（均值回归剧烈），务必三条件同时满足+严格止损。<br><br>
+    <b>⚠️ 诚实提示：</b>A股直接追高的历史统计：<span class="lv" data-ind="near_high" data-param="10">载入中…</span>（均值回归剧烈），务必三条件同时满足+严格止损。<br><br>
     <b>适合：</b>市场强势、主线明确时。 <b>不适合：</b>弱势市。`,
    exit:'卖出参考：跌回新高下方3%或触发止损价即离场，不恋战。'}},
  {key:'pullback', icon:'🎯', name:'缩量回踩', tag:'趋势+位置', desc:'上升趋势回调企稳，低吸',
@@ -1505,7 +1747,7 @@ const TEMPLATES=[
    logic:`<b>核心思想：</b>上升趋势中等回调结束再上车，买在别人恐慌时。<br><br>
     <b>条件1 · 站上60日线：</b>确认大趋势向上，不接下跌的飞刀。<br><br>
     <b>条件2 · 回撤企稳：</b>从高点回撤≥5%（真回调过）且连续5天收稳于5日线上（企稳了）。<br><br>
-    <b>历史依据：</b>全场回测最好的位置类因子——20日胜率49.1%。买点成本低，止损空间大。<br><br>
+    <b>历史依据：</b>回测成绩：<span class="lv" data-ind="pullback_stable" data-param="5">载入中…</span>（买点成本低，止损空间大）。<br><br>
     <b>适合：</b>有主线的牛市/结构市，龙头股回调低吸。 <b>不适合：</b>下降趋势（回踩会变下跌中继）。`,
    exit:'卖出参考：跌破企稳平台低点或止损价即离场。'}},
  {key:'vol_boom', icon:'💥', name:'放量启动', tag:'量+动量', desc:'连续放量上涨 ≥2天 + 当日涨≥3%',
@@ -1524,7 +1766,7 @@ const TEMPLATES=[
   detail:{
    title:'均线多头 — 为什么这样选？',
    logic:`<b>核心思想：</b>买教科书式的健康上涨结构。<br><br>
-    <b>条件 · 多头排列≥3天：</b>5日>10日>20日线且持续3天以上=短中长线买入者全部获利、无人急卖，趋势最扎实。单条件胜率46-47%中游，适合做组合基底。<br><br>
+    <b>条件 · 多头排列≥3天：</b>5日>10日>20日线且持续3天以上=短中长线买入者全部获利、无人急卖，趋势最扎实。单条件历史成绩：<span class="lv" data-ind="above_ma" data-param="30">载入中…</span>，适合做组合基底。<br><br>
     <b>适合：</b>趋势市做底仓条件，常与其他条件组合。 <b>不适合：</b>单独使用（信号太泛）。`,
    exit:'卖出参考：5日线下穿10日线（死叉）或触发止损价即离场。'}},
  {key:'box_squeeze', icon:'📦', name:'横盘蓄势', tag:'位置+波动', desc:'20日振幅≤10% + 波动收敛≤3%',
@@ -2097,7 +2339,7 @@ function renderDetail(sym, j){
       </div>
       <div id="kchartWrap" style="width:100%;overflow:hidden"><div id="kchartInline"></div></div>
       <div class="legend" style="font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.7">
-        <span style="color:#22c55e">▲触发信号(买)</span> 信号日收盘确认，次日开盘进场 &nbsp;
+        <span style="color:#22c55e">▲触发信号</span> 信号日收盘确认，次日开盘为参考进场位 &nbsp;
         <span style="color:#ef4444">✖失效参考(卖)</span> 收盘跌破红横线=买点逻辑失效，无条件离场 &nbsp;
         <span style="color:#8b5cf6">┄ 紫虚线</span> MA20生命线 &nbsp;
         <span style="color:var(--muted)">💡 每一次历史信号都标注了▲买卖提示</span>
@@ -2113,10 +2355,10 @@ function renderDetail(sym, j){
           <h4>🩺 基本面体检</h4><div class="health" id="health2"></div><table id="fmtab2"></table>
         </div>
         <div class="card">
-          <h4>💰 买卖点与止损</h4>
+          <h4>💰 参考点位与止损</h4>
           <div class="buybox">
             <div class="bk" style="color:var(--red)">
-              <div class="t">买点(次日开盘)</div>
+              <div class="t">参考买点(次日开盘)</div>
               <div class="v v-buy" id="bp2">-</div>
               <div class="sub" id="bp2sub">信号日+1</div>
             </div>
@@ -2269,18 +2511,26 @@ function renderScreenResult(){
   const R = SCREEN_RESULT; if(!R) return;
   const label = n => IND_LABEL[n] || PAT_CN[n] || n;
   const stopQ = parseFloat(document.getElementById('stopPct').value)||7;
-  const card = r => `
+  const card = r => {
+    const fh=r.fundamental_health;
+    const healthBadge=fh
+      ? `<span class="health ${fh.known===0?'na':fh.passed>=4?'ok':fh.passed>=3?'':'no'}" style="margin-left:auto;font-size:11.5px">体检 ${fh.grade} ${fh.passed}/${fh.known||fh.total}</span>`
+      : '';
+    return `
     <div class="cand" onclick="openDetail('${r.symbol}')">
       <div class="r1">
         <span class="code">${r.symbol}</span><span class="nm" title="${r._name||''}">${r._name||''}</span>
         <span class="badge b-${r.status==='triggered'?'good':'neutral'}">${r.status==='triggered'?'已触发':'接近 '+r.score+'%'}</span>
+        ${r.status==='triggered'?healthBadge:''}
       </div>
       <div class="r2" style="flex-wrap:wrap">
-        ${r.entry_price?`<span>买点 <b>${r.entry_price}</b></span>
+        ${r.entry_price?`<span>参考买点 <b>${r.entry_price}</b></span>
         <span>止损 <b style="color:var(--red)">${r.stop_price}</b></span>`:''}
+        ${r.status==='triggered'&&r.met&&r.met.length?`<span style="color:var(--green)" title="命中的筛选因子">✓ ${(r.met).map(label).join('、')}</span>`:''}
         ${r.missing&&r.missing.length?`<span style="color:var(--amber)">缺: ${(r.missing).map(label).join('、')}</span>`:''}
       </div>
     </div>`;
+  };
   const nTrig=(R.triggered||[]).length, nNear=(R.near||[]).length;
   let html = `<div style="background:linear-gradient(135deg,#13203a,#0f1a30);border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin-bottom:12px;display:flex;align-items:center;gap:22px;flex-wrap:wrap">
     <div><div style="font-size:11.5px;color:var(--muted)">今日已触发买点</div>
@@ -2290,11 +2540,14 @@ function renderScreenResult(){
     <div style="font-size:11.5px;color:var(--muted)">扫描 ${R.scanned} 只 · 买点=次日开盘 · 止损=买点×(1-止损%)只作风控</div>
     ${(R.upgraded&&R.upgraded.length)?`<div style="color:var(--amber);font-weight:700;font-size:12px;flex-basis:100%">🔔 升级提醒：${R.upgraded.map(u=>u.symbol+(u.name?' '+u.name:'')).join('、')} 已从"接近"转为"已触发"！（上次筛选 ${R.upgraded_from||''}）</div>`:''}
   </div>
+  ${NOVICE?`<div style="background:#2a230d;border:1px solid var(--amber);border-radius:10px;padding:10px 14px;margin-bottom:12px;font-size:12.5px;color:var(--text)">
+    🌱 <b>新手观察模式</b>：你的模拟记录还不到 20 笔。建议先在「💼 持仓管理」用<b>模拟模式</b>跟踪这些信号，累计自己的真实成绩后再把它当参考——历史胜率≠你当下的胜率。</div>`:''}
   <div style="color:var(--muted);font-size:12px;padding:0 4px 10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
     <button onclick="exportCsv()" style="width:auto;padding:4px 12px;margin:0;font-size:11.5px;background:#33415580">⬇ 导出CSV</button>
     <button onclick="aiInterpret()" id="aiBtn" style="width:auto;padding:4px 12px;margin:0;font-size:11.5px;background:#33415580">🤖 AI解读</button>
     <span style="margin-left:auto">排序：
       <select id="sortSel" onchange="resort()" aria-label="排序方式" style="padding:3px 7px;border-radius:6px;background:#0b1120;color:var(--text);border:1px solid var(--border);font-size:11.5px">
+        <option value="health">基本面体检 高→低（已触发组）</option>
         <option value="score">接近程度 高→低（仅接近组有效）</option>
         <option value="entry">买点价 从低到高</option>
       </select></span>
@@ -2335,16 +2588,37 @@ function resort(){
   const R = SCREEN_RESULT; if(!R) return;
   const mode = document.getElementById('sortSel').value;
   const cmp = {
+    health: (a,b)=>{
+      const ah=a.fundamental_health||{}, bh=b.fundamental_health||{};
+      const ak=ah.known?1:0, bk=bh.known?1:0;
+      return (bk-ak)||((bh.ratio||0)-(ah.ratio||0))||((bh.known||0)-(ah.known||0))||((b.score||0)-(a.score||0));
+    },
     score: (a,b)=>(b.score||0)-(a.score||0),
     entry: (a,b)=>(a.entry_price??1e9)-(b.entry_price??1e9)
   }[mode];
   R.triggered.sort(cmp);
-  R.near.sort(cmp);
+  R.near.sort(mode==='entry' ? cmp : (a,b)=>(b.score||0)-(a.score||0));
   renderScreenResult();
   document.getElementById('sortSel').value = mode;
 }
 
 // ================= AI 解读 & 设置（用户自带 API Key，本地存储） =================
+const AI_MODEL_PRESETS = [
+  {name:'DeepSeek 深度求索', base_url:'https://api.deepseek.com/v1', model:'deepseek-chat', tip:'国内直连·价格低'},
+  {name:'智谱 GLM',          base_url:'https://open.bigmodel.cn/api/paas/v4', model:'glm-4-flash', tip:'有免费额度'},
+  {name:'通义千问 阿里云',    base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'qwen-plus', tip:'百炼平台'},
+  {name:'Kimi 月之暗面',     base_url:'https://api.moonshot.cn/v1', model:'moonshot-v1-8k', tip:'长文本'},
+  {name:'OpenAI',            base_url:'https://api.openai.com/v1', model:'gpt-4o-mini', tip:'需国际网络'},
+  {name:'OpenRouter 聚合',   base_url:'https://openrouter.ai/api/v1', model:'openai/gpt-4o-mini', tip:'一个Key用多家'},
+  {name:'本地 Ollama 免费',  base_url:'http://127.0.0.1:11434/v1', model:'qwen2.5:7b', tip:'本机运行·无需Key'},
+];
+function applyAiPreset(){
+  const i = parseInt(document.getElementById('aiPreset').value);
+  if(!(i>=0) || !AI_MODEL_PRESETS[i]) return;
+  document.getElementById('aiBase').value = AI_MODEL_PRESETS[i].base_url;
+  document.getElementById('aiModel').value = AI_MODEL_PRESETS[i].model;
+}
+
 async function openAISettings(){
   let cfg={base_url:'https://api.openai.com/v1', model:'', api_key_masked:'', api_key_set:false};
   let hitCfg={api_key_set:false, api_key_masked:''};
@@ -2364,6 +2638,13 @@ async function openAISettings(){
       填入你自己的大模型 API Key（OpenAI 兼容接口均可：DeepSeek / 通义 / Kimi / GLM / Ollama 等）。
       Key 只保存在你本机 data/meta/ai_config.json，不会上传到任何服务器，调用费用由你自己的账户承担。</div>
     <div style="display:flex;flex-direction:column;gap:9px;font-size:12.5px">
+      <label>快速选择模型（选中后自动填好地址和模型名，你只需填 API Key）
+        <select id="aiPreset" onchange="applyAiPreset()"
+          style="width:100%;padding:7px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border);margin-top:3px">
+          <option value="-1">— 选择服务商 —</option>
+          ${AI_MODEL_PRESETS.map((p,i)=>`<option value="${i}">${p.name} · ${p.model}（${p.tip}）</option>`).join('')}
+          <option value="-1">自定义（手动填写下面两项）</option>
+        </select></label>
       <label>接口地址 Base URL
         <input id="aiBase" value="${cfg.base_url||''}" placeholder="https://api.deepseek.com/v1"
           style="width:100%;padding:7px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border);margin-top:3px"></label>
@@ -2467,9 +2748,193 @@ async function aiInterpret(){
   }
 }
 
-loadIndicators().then(()=>{bindIndRowEvents(); renderTemplates();});
+// ================= 合规 · 反馈 · 自动更新 · 新手引导 =================
+let NOVICE = false;
+
+function _modal(html){
+  const ov = document.createElement('div');
+  ov.className = 'ovl';
+  ov.innerHTML = `<div class="mcard">${html}</div>`;
+  document.body.appendChild(ov);
+  return ov;
+}
+
+async function initCompliance(){
+  try{
+    const c = await (await fetch('/api/app_config')).json();
+    const chk = document.getElementById('autoUpdChk');
+    if(chk) chk.checked = !!c.auto_update_enabled;
+  }catch(e){}
+  try{
+    const g = await (await fetch('/api/paper_gate')).json();
+    NOVICE = !!g.novice;
+  }catch(e){}
+  let needWiz = false;
+  try{
+    const j = await (await fetch('/api/data_status')).json();
+    needWiz = !(j.ready && (j.total_symbols||0) > 50);
+  }catch(e){}
+  try{
+    const d = await (await fetch('/api/disclaimer')).json();
+    if(!d.accepted){
+      showDisclaimerModal(d.text, ()=>{
+        if(needWiz && !localStorage.getItem('sps_onboarded')) showWizard();
+      });
+      return;
+    }
+  }catch(e){}
+  if(needWiz && !localStorage.getItem('sps_onboarded')) showWizard();
+}
+
+function showDisclaimerModal(text, onAccept){
+  _modal(`
+    <div style="font-size:16px;font-weight:800;margin-bottom:12px">⚠️ 使用前必读</div>
+    <div style="font-size:13px;line-height:1.9;color:var(--text);margin-bottom:16px">${text}</div>
+    <button class="green" style="width:100%;padding:10px" onclick="acceptDisclaimer(this)">我已阅读并理解上述内容</button>`);
+  window._wizAfterDisclaimer = onAccept || null;
+}
+async function acceptDisclaimer(btn){
+  try{ await fetch('/api/disclaimer',{method:'POST'}); }catch(e){}
+  const ov = btn.closest('.ovl');
+  if(ov) ov.remove();
+  if(window._wizAfterDisclaimer){ const f = window._wizAfterDisclaimer; window._wizAfterDisclaimer=null; f(); }
+}
+
+async function saveAutoUpd(on){
+  try{
+    await fetch('/api/app_config',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({auto_update_enabled:on})});
+  }catch(e){ alert('保存设置失败'); return; }
+  if(on) alert('已开启每日自动更新：到达设定时间（默认17:30）且本程序处于运行状态时，自动增量刷新数据。');
+}
+
+function openFeedback(){
+  _modal(`
+    <div style="font-size:15px;font-weight:800;margin-bottom:10px">💬 问题反馈</div>
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">遇到数据不对、筛选异常、界面问题，或想要新功能，都可以留言。反馈会保存在本机 data/runs/feedback.log（附数据状态快照，便于排障），可随时把该文件发给开发者。</div>
+    <textarea id="fbText" rows="4" placeholder="请描述你遇到的问题或建议…" style="width:100%;padding:8px;border-radius:8px;background:#0b1120;color:var(--text);border:1px solid var(--border);font-size:12.5px"></textarea>
+    <input id="fbContact" placeholder="联系方式（选填，如微信/邮箱）" style="width:100%;padding:8px;margin-top:8px;border-radius:8px;background:#0b1120;color:var(--text);border:1px solid var(--border);font-size:12.5px">
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="green" style="flex:1;padding:9px" onclick="submitFeedback(this)">提交反馈</button>
+      <button style="width:auto;padding:9px 14px" onclick="this.closest('.ovl').remove()">取消</button>
+    </div>
+    <div id="fbMsg" style="font-size:12px;margin-top:8px"></div>`);
+}
+async function submitFeedback(btn){
+  const text = document.getElementById('fbText').value.trim();
+  const msg = document.getElementById('fbMsg');
+  if(!text){ msg.textContent='❌ 请先填写反馈内容'; msg.style.color='var(--red)'; return; }
+  const r = await fetch('/api/feedback',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text, contact:document.getElementById('fbContact').value.trim()})});
+  if(!r.ok){ msg.textContent='❌ 提交失败，请重试'; msg.style.color='var(--red)'; return; }
+  msg.textContent='✅ 已记录，感谢反馈！可把 data/runs/feedback.log 发送给开发者';
+  msg.style.color='var(--green)';
+  setTimeout(()=>{ const ov=btn.closest('.ovl'); if(ov) ov.remove(); }, 2600);
+}
+
+// ---- 新手引导向导：下载数据 → 第一次筛选 → 第一笔模拟仓 ----
+let WIZ_STEP = 0, _wizPoll = null;
+function showWizard(){
+  if(document.getElementById('wizOv')) return;
+  const ov = document.createElement('div');
+  ov.className = 'ovl'; ov.id = 'wizOv';
+  document.body.appendChild(ov);
+  WIZ_STEP = 0;
+  renderWiz();
+}
+function wizTplBtn(icon, name, key, desc){
+  return `<button style="width:auto;padding:10px 14px;font-size:12.5px" onclick="wizRunTpl('${key}')">${icon} ${name}<div style="font-size:10.5px;color:var(--muted);font-weight:400">${desc}</div></button>`;
+}
+function wizRunTpl(key){
+  useTemplate(key);
+  doScreen();
+  wizFinish();
+}
+function wizFinish(){
+  localStorage.setItem('sps_onboarded','1');
+  const ov = document.getElementById('wizOv');
+  if(ov) ov.remove();
+  clearInterval(_wizPoll); _wizPoll = null;
+}
+function renderWiz(){
+  const ov = document.getElementById('wizOv'); if(!ov) return;
+  let body = '';
+  if(WIZ_STEP === 0){
+    body = `
+      <div style="font-size:17px;font-weight:800;margin-bottom:10px">👋 欢迎使用 SPS</div>
+      <div style="font-size:12.5px;line-height:1.9;color:var(--text)">
+        第一次使用需要三步：<br>
+        ① <b>下载全市场行情</b>（约 5300 只 A 股日线，首次约需 30~60 分钟，之后每天增量只要几秒）<br>
+        ② <b>选一个风格模板</b>，跑出你的第一批研究标的<br>
+        ③ <b>记第一笔模拟仓</b>——建议先用模拟模式跟踪 20 笔，看看自己的成绩，再考虑实际参考
+      </div>
+      <div style="display:flex;gap:8px;margin-top:16px">
+        <button class="green" style="flex:1;padding:10px" onclick="WIZ_STEP=1;runScanData();renderWiz()">开始：下载全市场数据</button>
+        <button style="width:auto;padding:10px 14px" onclick="wizFinish()">跳过</button>
+      </div>`;
+  } else if(WIZ_STEP === 1){
+    body = `
+      <div style="font-size:16px;font-weight:800;margin-bottom:10px">⬇ 正在下载行情数据</div>
+      <div style="font-size:12.5px;color:var(--muted);line-height:1.9">首次下载约需几分钟（视网络情况），进度显示在页面顶部状态栏。下载完成后会自动进入下一步。</div>
+      <div id="wizProg" style="font-size:13px;color:var(--accent);margin-top:12px;font-weight:700">检查数据中…</div>
+      <button style="width:auto;padding:8px 14px;margin-top:14px" onclick="wizFinish()">后台继续，先跳过</button>`;
+    if(!_wizPoll){
+      _wizPoll = setInterval(async()=>{
+        try{
+          const j = await (await fetch('/api/data_status')).json();
+          const el = document.getElementById('wizProg');
+          if(!el) { clearInterval(_wizPoll); _wizPoll=null; return; }
+          if(j.ready && (j.total_symbols||0) > 3000){
+            clearInterval(_wizPoll); _wizPoll = null;
+            WIZ_STEP = 2; renderWiz();
+          }
+        }catch(e){}
+      }, 4000);
+    }
+  } else {
+    body = `
+      <div style="font-size:16px;font-weight:800;margin-bottom:6px">✅ 数据就绪！</div>
+      <div style="font-size:12.5px;color:var(--muted);margin-bottom:14px">选一个风格，马上跑出你的第一批研究标的（点标的卡片可看每只票为什么入选）：</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${wizTplBtn('🐢','稳健趋势','trend','站上20日线+放量')}
+        ${wizTplBtn('🎯','缩量回踩','pullback','趋势中低吸')}
+        ${wizTplBtn('🚀','突破追涨','breakout','创新高+巨量')}
+      </div>
+      <button style="width:auto;padding:8px 14px;margin-top:14px" onclick="wizFinish()">稍后自己选</button>`;
+  }
+  ov.innerHTML = `<div class="mcard">${body}</div>`;
+}
+
+// ---- 实时回测统计填充（替换文案里写死的胜率） ----
+function fillLiveStats(){
+  document.querySelectorAll('.lv').forEach(el=>{
+    if(!PARAM_STATS){
+      el.textContent = '暂无回测数据（先跑一次「参数回测」生成）';
+      el.style.color = 'var(--muted)';
+      return;
+    }
+    const g = (PARAM_STATS.stats||{})[el.dataset.ind];
+    if(!g){ el.textContent = '该因子暂无回测记录'; return; }
+    const param = parseFloat(el.dataset.param);
+    const keys = Object.keys(g).map(Number).sort((a,b)=>Math.abs(a-param)-Math.abs(b-param));
+    const rec = g[String(keys[0])];
+    if(!rec || rec.win20==null){ el.textContent = '该参数暂无有效回测样本'; return; }
+    const col = rec.win20>=55?'var(--green)':rec.win20>=45?'var(--amber)':'var(--red)';
+    el.style.color = col;
+    let s = `20日胜率 ${rec.win20}%（样本 ${rec.n_signals}`;
+    if(rec.oos_win20!=null) s += ` · 样本外 ${rec.oos_win20}%`;
+    s += ` · 统计截至 ${PARAM_STATS.generated||'近期'}）`;
+    el.textContent = s;
+  });
+}
+
+loadIndicators().then(()=>{bindIndRowEvents(); renderTemplates(); fillLiveStats();});
 loadStrategies();
 checkFresh();
+checkCandidateMeta();
+initCompliance();
 
 // ================= 页签切换 =================
 function showTab(t){
@@ -2513,6 +2978,11 @@ function renderPositions(){
       <input id="posPrice" type="number" placeholder="买入价" step="any" style="width:90px;padding:6px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border)">
       <input id="posDate" type="date" style="padding:6px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border)">
       <span style="color:var(--muted)">止损%</span><input id="posStop" type="number" value="7" style="width:52px;padding:6px;border-radius:7px;background:#0b1120;color:var(--text);border:1px solid var(--border)">
+      <span style="color:var(--muted);border-left:1px solid var(--border);padding-left:10px">模式</span>
+      <label style="display:flex;align-items:center;gap:3px;cursor:pointer" title="模拟仓：用固定金额假想成交，跟踪成绩用，不涉及真钱。建议新手先记满20笔模拟再实盘。">
+        <input type="radio" name="posMode" value="paper" checked> 📝 模拟</label>
+      <label style="display:flex;align-items:center;gap:3px;cursor:pointer">
+        <input type="radio" name="posMode" value="live"> 💰 实盘</label>
     </div>
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:12px" id="ruleChks">
       ${Object.entries(D.exit_rules).map(([k,v])=>`
@@ -2550,7 +3020,8 @@ function renderPositions(){
       <div class="r1">
         <span title="${r.health_tip||''}" style="cursor:help">${h.dot}</span>
         <span class="code">${r.symbol}</span><span class="nm" title="${r.name||''}">${r.name||''}</span>
-        <span class="badge ${sell?'b-bad':r.health==='yellow'?'b-neutral':'b-good'}">${r.action==='warn_sell'?'⚠明日卖':sell?'应卖出':h.label}</span>
+        <span class="badge ${r.mode==='paper'?'b-neutral':''}" style="${r.mode==='paper'?'':'background:#134e2a;color:#bbf7d0'}">${r.mode==='paper'?'📝模拟':'💰实盘'}</span>
+        <span class="badge ${sell?'b-bad':r.health==='yellow'?'b-neutral':'b-good'}">${r.action==='warn_sell'?'⚠明日退出参考':sell?'触发退出信号':h.label}</span>
         <span style="margin-left:auto;font-weight:700;color:${(r.pnl_pct??0)>=0?'var(--red)':'var(--green)'}">${(r.pnl_pct??0)>=0?'+':''}${r.pnl_pct??0}%</span>
               </div>
               <div class="r2" style="flex-wrap:wrap">
@@ -2572,11 +3043,26 @@ function renderPositions(){
     html += D.history.slice().reverse().map(r=>`
       <div class="cand" style="cursor:default">
         <div class="r1"><span class="code">${r.symbol}</span><span class="nm" title="${r.name||''}">${r.name||''}</span>
+            <span style="font-size:10.5px;color:var(--muted)">${r.mode==='paper'?'📝模拟':'💰实盘'}</span>
             <span style="margin-left:auto;font-weight:700;color:${(r.pnl_pct??0)>=0?'var(--red)':'var(--green)'}">${(r.pnl_pct??0)>=0?'+':''}${r.pnl_pct??0}%</span></div>
                     <div class="r2"><span>${r.entry_date} → ${r.exit_date}</span>
           <span>退出原因: ${EXIT_RULE_CN[r.exit_reason]||r.exit_reason}</span></div>
       </div>`).join('');
   }
+  // 模拟盘复盘报告入口
+  html += `<div style="color:var(--accent);font-weight:700;font-size:12.5px;margin:14px 4px 6px">▸ 模拟盘复盘报告</div>
+  <div class="card" style="margin-bottom:12px">
+    <div style="font-size:12px;color:var(--muted);margin-bottom:8px">用真实跟踪记录回答"跟着系统做，成绩到底如何"。用 <b>📝模拟模式</b> 登记并平仓后，在这里生成复盘。模拟记录满 20 笔前，界面保持新手观察模式。</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="green" style="width:auto;padding:7px 20px;margin:0" onclick="loadReview()">📋 生成复盘报告</button>
+      <span style="color:var(--muted);font-size:12px">统计最近
+        <select id="revDays" style="padding:3px 7px;border-radius:6px;background:#0b1120;color:var(--text);border:1px solid var(--border);font-size:12px">
+          <option value="30">30</option><option value="60">60</option><option value="90">90</option><option value="180">180</option>
+        </select> 天</span>
+      <span id="revMsg" style="font-size:12px;color:var(--muted)"></span>
+    </div>
+  </div>
+  <div id="revResult"></div>`;
   // 持仓自检回放入口
   html += `<div style="color:var(--amber);font-weight:700;font-size:12.5px;margin:14px 4px 6px">▸ 持仓自检回放</div>
   <div class="card" style="margin-bottom:12px">
@@ -2645,11 +3131,12 @@ function collectRules(){
 
 async function addPos(){
   const msg = document.getElementById('posMsg');
+  const mode = (document.querySelector('input[name="posMode"]:checked')||{}).value || 'paper';
   const body = {symbol: document.getElementById('posSym').value.trim(),
     name: '', entry_price: parseFloat(document.getElementById('posPrice').value),
     entry_date: document.getElementById('posDate').value,
     stop_pct: parseFloat(document.getElementById('posStop').value)||7,
-    rules: collectRules()};
+    rules: collectRules(), mode: mode};
   if(!body.symbol || !body.entry_price){ msg.textContent='❌ 请填代码和买入价'; msg.style.color='var(--red)'; return; }
   const r = await fetch('/api/positions',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -2657,6 +3144,40 @@ async function addPos(){
   if(!r.ok){ msg.textContent='❌ '+(j.error||'失败'); msg.style.color='var(--red)'; return; }
   msg.textContent='✅ 已登记'; msg.style.color='var(--green)';
   loadPositions();
+}
+
+async function loadReview(){
+  const days = document.getElementById('revDays')?.value || 30;
+  const el = document.getElementById('revResult');
+  const msg = document.getElementById('revMsg');
+  msg.textContent = '统计中…';
+  const r = await fetch('/api/review_report?days='+days);
+  const j = await r.json();
+  msg.textContent = '';
+  if(!r.ok){ el.innerHTML = `<div style="color:var(--red);font-size:12.5px">${j.error||'加载失败'}</div>`; return; }
+  if(!j.n_total){
+    el.innerHTML = `<div style="color:var(--muted);font-size:12.5px;padding:6px 2px">暂无模拟仓记录。在上方用 📝模拟 模式登记一笔，平仓后即可生成复盘。</div>`;
+    return;
+  }
+  const ER_CN = EXIT_RULE_CN;
+  const reasons = Object.entries(j.exit_reasons||{}).map(([k,v])=>`${ER_CN[k]||k}×${v}`).join('、')||'-';
+  const stat = (label, val, color) => `<div style="min-width:90px"><div style="font-size:10.5px;color:var(--muted)">${label}</div>
+    <div style="font-size:19px;font-weight:800;${color?`color:${color}`:''}">${val}</div></div>`;
+  let html = `<div class="card" style="border-color:var(--accent)">
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:10px">
+      ${stat('平仓笔数', j.n_closed??0)}
+      ${j.win_rate!=null?stat('胜率', j.win_rate+'%', (j.win_rate>=50?'var(--green)':'var(--red)')):''}
+      ${j.avg_pnl!=null?stat('平均收益', (j.avg_pnl>0?'+':'')+j.avg_pnl+'%', (j.avg_pnl>=0?'var(--red)':'var(--green)')):''}
+      ${j.best!=null?stat('最好一笔', '+'+j.best+'%', 'var(--red)'):''}
+      ${j.worst!=null?stat('最差一笔', j.worst+'%', 'var(--green)'):''}
+      ${j.avg_hold_days!=null?stat('平均持有', j.avg_hold_days+' 天'):''}
+    </div>
+    <div style="font-size:11.5px;color:var(--muted)">退出原因分布：${reasons} · 在持模拟仓 ${j.n_open??0} 笔 ·
+      统计窗口：最近 ${j.days} 天</div>
+    ${j.win_rate!=null&&j.win_rate<50?`<div style="font-size:11.5px;color:var(--amber);margin-top:6px">⚠ 当前模拟胜率低于 50%：先回头检查退出规则执行是否严格、条件是否适合近期市场，再考虑增加参考权重。</div>`:''}
+    ${j.n_total<20?`<div style="font-size:11.5px;color:var(--amber);margin-top:6px">🌱 模拟记录 ${j.n_total}/20 笔：样本还不够，暂不足以评价这套方法，继续记录。</div>`:''}
+  </div>`;
+  el.innerHTML = html;
 }
 
 async function delPos(sym){
@@ -2775,10 +3296,50 @@ async function doReplay(){
   res.innerHTML = html;
 }
 </script>
+<div style="position:fixed;left:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8">形态候选 = 深度扫描记录的历史形态信号（W底/平台突破/杯柄/口袋支点），供研究统计 · 日常选股用「🔍 筛选」</div><div style="position:fixed;right:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8;text-align:right">SPS · 本地研究工具 · 所有信号与统计均为历史数据参考，不构成投资建议</div>
 </body>
 </html>
 """
 
+def server_is_ready(url: str, opener=None) -> bool:
+    opener = opener or urllib.request.urlopen
+    try:
+        health_url = url.rstrip("/") + "/api/health"
+        with opener(health_url, timeout=0.8) as response:
+            if response.status >= 500:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+            return payload.get("service") == "SPS" and payload.get("ok") is True
+    except Exception:
+        return False
+
+
+def open_browser_when_ready(url: str, attempts: int = 40, interval: float = 0.25,
+                            probe=None, browser_open=None, sleep=None) -> bool:
+    """Wait for the local server, then open exactly one browser tab."""
+    probe = probe or server_is_ready
+    browser_open = browser_open or webbrowser.open
+    sleep = sleep or time.sleep
+    for _ in range(attempts):
+        if probe(url):
+            browser_open(url)
+            return True
+        sleep(interval)
+    return False
+
+
 if __name__ == "__main__":
-    print("SPS 交互界面: http://127.0.0.1:5000")
-    app.run(debug=False, port=5000)
+    import multiprocessing
+    multiprocessing.freeze_support()   # PyInstaller 多进程（并行形态检测）引导
+    port = int(os.environ.get("SPS_PORT", "5000"))
+    url = f"http://127.0.0.1:{port}"
+    open_browser = os.environ.get("SPS_NO_BROWSER") != "1"
+    if server_is_ready(url):
+        if open_browser:
+            webbrowser.open(url)
+        raise SystemExit(0)
+    print(f"SPS 交互界面: {url}")
+    if open_browser:
+        threading.Thread(target=open_browser_when_ready, args=(url,), daemon=True).start()
+    threading.Thread(target=_auto_update_loop, daemon=True, name="sps-auto-update").start()
+    app.run(debug=False, host="127.0.0.1", port=port, use_reloader=False)

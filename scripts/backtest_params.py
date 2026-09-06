@@ -21,13 +21,12 @@ import numpy as np
 import pandas as pd
 
 from sps.data import DATA_DIR
-from sps.positions import COMMISSION_RATE, STAMP_TAX, SLIPPAGE
+from sps.positions import COMMISSION_RATE, COST_PER_TRADE, STAMP_TAX, SLIPPAGE
 from sps.screener import INDICATORS, _rps_series
 
 RUN_DIR = DATA_DIR / "runs"
 OUT = RUN_DIR / "param_stats.json"
 OOS_DAYS = 120          # 样本外验证窗口：最近120个交易日
-COST_PER_TRADE = COMMISSION_RATE * 2 + STAMP_TAX + SLIPPAGE * 2   # 单边合计~0.68%
 
 # 每个指标的参数网格（覆盖常用档位；用户自定义值会映射到最近档位展示）
 GRIDS = {
