@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>SPS — 让每一次买入，都有据可依</title>
+<style>
+:root{--bg:#0b1120;--panel:#111a2e;--card:#16213a;--border:#253352;
+      --text:#e2e8f0;--muted:#8ea0bd;--accent:#3b82f6;--green:#22c55e;
+      --red:#ef4444;--amber:#f59e0b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,"Microsoft YaHei",sans-serif;
+     height:100vh;overflow:hidden}
+.deck{position:relative;height:100vh}
+.slide{position:absolute;inset:0;display:none;flex-direction:column;
+       padding:48px 72px;animation:fadein .45s ease}
+.slide.on{display:flex}
+@keyframes fadein{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.kicker{font-size:14px;letter-spacing:.35em;color:var(--accent);font-weight:700;margin-bottom:14px}
+h1{font-size:52px;font-weight:800;line-height:1.25}
+h2{font-size:36px;font-weight:800;margin-bottom:6px}
+.sub{font-size:17px;color:var(--muted);margin-bottom:22px;line-height:1.7}
+.imgwrap{flex:1;display:flex;align-items:center;justify-content:center;min-height:0;
+         background:#0e1628;border:1px solid var(--border);border-radius:16px;
+         padding:14px;box-shadow:0 24px 70px rgba(0,0,0,.45)}
+.imgwrap img{max-width:100%;max-height:100%;border-radius:8px}
+.points{display:flex;gap:14px;margin-top:18px;flex-wrap:wrap}
+.pill{background:var(--card);border:1px solid var(--border);border-radius:99px;
+      padding:8px 18px;font-size:14px;color:var(--text)}
+.pill b{color:var(--green)}
+.cover{justify-content:center;align-items:flex-start;
+       background:radial-gradient(1200px 600px at 75% 20%,#16213a 0%,var(--bg) 60%)}
+.cover h1{font-size:64px}
+.cover .logo{font-size:20px;font-weight:800;color:var(--accent);letter-spacing:.3em;margin-bottom:26px}
+.cover .slog{font-size:22px;color:var(--muted);margin-top:20px;line-height:1.8}
+.stats{display:flex;gap:34px;margin-top:44px}
+.stat .n{font-size:34px;font-weight:800;color:var(--green)}
+.stat .t{font-size:13px;color:var(--muted);margin-top:4px}
+.end{justify-content:center;align-items:center;text-align:center;
+     background:radial-gradient(900px 500px at 50% 45%,#16213a 0%,var(--bg) 65%)}
+.end h1{font-size:44px;margin:22px 0}
+.end .disc{position:absolute;bottom:90px;font-size:12px;color:var(--muted)}
+.nav{position:fixed;bottom:26px;right:44px;display:flex;gap:10px;align-items:center;z-index:9}
+.nav button{background:var(--card);color:var(--text);border:1px solid var(--border);
+            border-radius:10px;padding:9px 20px;font-size:15px;cursor:pointer}
+.nav button:hover{border-color:var(--accent)}
+.counter{position:fixed;bottom:34px;left:48px;font-size:13px;color:var(--muted);z-index:9}
+.dots{position:fixed;bottom:0;left:0;height:4px;background:var(--accent);transition:width .3s;z-index:9}
+.hint{position:fixed;bottom:30px;left:50%;transform:translateX(-50%);
+      font-size:12px;color:var(--muted);z-index:9}
+.footnote{margin-top:auto;font-size:11px;color:var(--muted);opacity:.75}
+</style>
+</head>
+<body>
+<div class="deck" id="deck"></div>
+<div class="dots" id="dots"></div>
+<div class="counter" id="counter"></div>
+<div class="hint">← → 方向键 / 点击按钮翻页 · F 全屏</div>
+<div class="nav">
+  <button onclick="prev()">← 上一页</button>
+  <button onclick="next()">下一页 →</button>
+  <button onclick="toggleFS()">⛶</button>
+</div>
+
+<script>
+const IMG = p => "img/" + p;
+const S = [
+ {type:"cover",
+  html:`<div class="logo">SPS · STOCK PATTERN SYSTEM</div>
+        <h1>让每一次买入，<br>都有据可依。</h1>
+        <div class="slog">本地运行的 A 股形态识别与量化选股工作台<br>
+        不荐股 · 不收费 · 数据自持</div>
+        <div class="stats">
+          <div class="stat"><div class="n">5353</div><div class="t">全市场覆盖（只）</div></div>
+          <div class="stat"><div class="n">18+8</div><div class="t">可选因子 / 回测风格模板</div></div>
+          <div class="stat"><div class="n">69</div><div class="t">自动化回归测试</div></div>
+          <div class="stat"><div class="n">0</div><div class="t">数据上传服务器</div></div>
+        </div>`},
+ {img:IMG("01_home.png"), kicker:"一分钟上手", title:"选股，从选风格开始",
+  sub:"8 种经过全市场回测的风格模板——点一下就开筛，也可以用 18 个因子自由组合。",
+  pills:["<b>8</b> 风格模板","组合冲突自动检测","策略可保存复用","止损比例全局风控"]},
+ {img:IMG("02_screen_progress.png"), kicker:"透明可解释", title:"先讲清楚为什么，再给结果",
+  sub:"每张模板卡片背后都有大白话解读与历史依据——工具不做黑盒。"},
+ {img:IMG("03_results.png"), kicker:"几秒钟筛完全市场", title:"691 只触发 · 行业分布 · 基本面体检",
+  sub:"全市场 5353 只一次筛完：已触发 / 接近触发分层，行业分布点击可过滤，每只票带五项基本面体检评分。",
+  pills:["行业分布 Top30","基本面体检 5/5","命中因子直接标注","新手观察模式引导"]},
+ {img:IMG("04_detail_panel.png"), kicker:"同页切换不跳转", title:"点开候选：K线 · 历史信号 · 买卖参考位",
+  sub:"每一次历史信号都标注在 K 线上，买卖点参考与失效退出线一目了然。",
+  pills:["Plotly 可缩放K线","历史信号 20 日胜率","MA20 趋势生命线"]},
+ {img:IMG("11_detail_page.png"), kicker:"买前该看什么，界面替你列好", title:"基本面体检 + 参考点位 + 失效条件",
+  sub:"净利润/营收/ROE/毛利率/负债率五项体检，参考买点、止损价、MA20 关键位同屏。",
+  pills:["体检 优秀 5/5","参考买点(次日开盘)","止损 -7%","失效退出参考线"]},
+ {img:IMG("08_replay.png"), kicker:"最硬核的一招", title:"把时间拨回 40 天前，验证「如果那天用了系统」",
+  sub:"历史回放重现当天的全市场触发名单，并统计其后 20 日真实收益（含成本）——回放 2026-07-28：触发 238 只，胜率 50%，平均 +2.6%。",
+  pills:["任意日期回放","其后20日真实收益","含佣金印花税滑点"]},
+ {img:IMG("06_positions.png"), kicker:"买后自动盯盘", title:"持仓管理：健康度红绿灯 + 卖出规则引擎",
+  sub:"登记持仓后每日自动诊断：距止损余量、MA20 上下方、峰值回撤，触发卖出规则即刻提醒。",
+  pills:["🟢🟡🔴 健康度","5 条卖出规则可组合","📝模拟 / 💰实盘双模式","明日退出参考"]},
+ {img:IMG("07_review.png"), kicker:"教练，不是答案机", title:"模拟盘复盘：用真实跟踪回答「成绩到底如何」",
+  sub:"建议先模拟跟踪 20 笔再实战——复盘报告统计胜率、平均收益、退出原因分布，样本不足时如实告诉你。",
+  pills:["胜率/平均收益","退出原因分布","新手观察模式"]},
+ {img:IMG("09_datastatus.png"), kicker:"数据透明", title:"未同步是谁？落后几天？点一下就知道",
+  sub:"数据状态逐票明细：停牌、未同步、长期停牌分开列示——不让一个数字制造焦虑。"},
+ {img:IMG("10_ai_settings.png"), kicker:"AI 解读，Key 归你", title:"7 家主流模型预填好，只填 API Key",
+  sub:"DeepSeek / 智谱 / 通义 / Kimi / OpenAI / OpenRouter / 本地 Ollama——接口地址与模型名自动填好，Key 只存本机。",
+  pills:["自带 Key 计费","不传任何服务器","合规约束：不输出方向性指令"]},
+ {type:"end",
+  html:`<div class="kicker" style="text-align:center;width:100%">本地运行 · 数据自持 · 研究工具</div>
+        <h1>SPS — 让每一次买入，都有据可依。</h1>
+        <div class="slog">8 风格模板 · 18 因子自由组合 · 历史回放 · 持仓纪律教练 · AI 解读</div>`},
+];
+const deck=document.getElementById('deck');
+S.forEach((s,i)=>{
+  const d=document.createElement('div');
+  d.className='slide'+(i===0?' on':'');
+  if(s.type==='cover'||s.type==='end'){ d.className+=' '+(s.type==='cover'?'cover':'end'); d.innerHTML=s.html; }
+  else{
+    d.innerHTML=`<div class="kicker">${s.kicker}</div><h2>${s.title}</h2>
+      <div class="sub">${s.sub}</div>
+      <div class="imgwrap"><img src="${s.img}" alt="${s.title}"></div>
+      ${s.pills?`<div class="points">${s.pills.map(p=>`<div class="pill">${p}</div>`).join('')}</div>`:''}
+      <div class="footnote">SPS · 本地研究工具 · 所有信号与统计均为历史数据参考，不构成投资建议</div>`;
+  }
+  deck.appendChild(d);
+});
+let cur=0;
+function show(i){
+  cur=Math.max(0,Math.min(S.length-1,i));
+  document.querySelectorAll('.slide').forEach((el,k)=>el.classList.toggle('on',k===cur));
+  document.getElementById('dots').style.width=((cur+1)/S.length*100)+'vw';
+  document.getElementById('counter').textContent=(cur+1)+' / '+S.length;
+}
+function next(){show(cur+1)} function prev(){show(cur-1)}
+function toggleFS(){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()}
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown') next();
+  if(e.key==='ArrowLeft'||e.key==='PageUp') prev();
+  if(e.key==='f'||e.key==='F') toggleFS();
+  if(e.key==='Home') show(0); if(e.key==='End') show(S.length-1);
+});
+show(0);
+</script>
+</body>
+</html>
