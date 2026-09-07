@@ -426,3 +426,105 @@ def review_report(days: int = 30) -> dict:
          "entry_date": r["entry_date"], "entry_price": r["entry_price"]}
         for r in open_recs]
     return out
+
+
+# ---------------------------------------------------------------- 模拟盘 P&L 曲线
+
+def simulate_paper_trades(positions: list[dict] | None = None,
+                          initial_capital: float = 100000) -> dict:
+    """模拟盘 P&L 曲线：基于持仓记录生成权益曲线（equity curve）。
+
+    每个持仓按等权重分配资金（initial_capital / n_trades），追踪
+    entry_value / exit_value / shares。open 持仓按 entry_price 计
+    exit_value（浮动盈亏）。
+
+    返回 {
+        'equity_curve':   [...],   # 累计权益值列表，长度 = n_trades + 1
+        'total_return':   float,   # 总收益率 %
+        'max_drawdown':   float,   # 最大回撤 %
+        'trade_history':  [...],   # 每笔交易的明细
+        'initial_capital': float,
+        'final_equity':   float,
+    }
+    """
+    if positions is None:
+        positions = [r for r in load_positions() if r.get("mode", "paper") == "paper"]
+
+    if not positions:
+        return {"equity_curve": [initial_capital], "total_return": 0.0,
+                "max_drawdown": 0.0, "trade_history": [],
+                "initial_capital": initial_capital,
+                "final_equity": initial_capital}
+
+    # 按入场日期排序
+    sorted_pos = sorted(positions, key=lambda r: r.get("entry_date", ""))
+    n = len(sorted_pos)
+    capital_per_trade = initial_capital / n
+
+    trade_history = []
+    equity_curve = [initial_capital]
+    current_equity = initial_capital
+
+    for rec in sorted_pos:
+        entry_price = float(rec.get("entry_price", 0))
+        # open 持仓无 exit_price，按 entry_price 计（浮动=0）
+        exit_price = float(rec.get("exit_price", entry_price)) \
+            if rec.get("status") == "closed" else entry_price
+        entry_date = rec.get("entry_date", "")
+        exit_date = rec.get("exit_date", entry_date)
+
+        if entry_price <= 0:
+            continue
+
+        # 扣除往返成本后的实际可投资金
+        cost_reserve = capital_per_trade * COST_PER_TRADE
+        invest_amount = capital_per_trade - cost_reserve
+        shares = invest_amount / entry_price
+
+        entry_value = shares * entry_price
+        exit_value = shares * exit_price
+
+        # 该笔交易盈亏 = 卖出所得 - 买入成本 - 交易费用
+        pnl = exit_value - entry_value - cost_reserve
+        pnl_pct = (pnl / entry_value) * 100 if entry_value > 0 else 0.0
+
+        trade_history.append({
+            "symbol": rec.get("symbol", ""),
+            "name": rec.get("name", ""),
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "shares": round(shares, 2),
+            "entry_value": round(entry_value, 2),
+            "exit_value": round(exit_value, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "exit_reason": rec.get("exit_reason", "open"),
+            "status": rec.get("status", "open"),
+        })
+
+        current_equity += pnl
+        equity_curve.append(round(current_equity, 2))
+
+    # 总收益率
+    total_return = (current_equity / initial_capital - 1) * 100
+
+    # 最大回撤
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for v in equity_curve:
+        if v > peak:
+            peak = v
+        dd = (peak - v) / peak * 100 if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+
+    return {
+        "equity_curve": equity_curve,
+        "total_return": round(total_return, 2),
+        "max_drawdown": round(max_dd, 2),
+        "trade_history": trade_history,
+        "initial_capital": initial_capital,
+        "final_equity": round(current_equity, 2),
+    }

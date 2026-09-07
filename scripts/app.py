@@ -662,11 +662,13 @@ def api_positions():
     daily = _load_daily_min(open_syms)
     diag = run_diagnosis(daily)
     names = symbol_names()
-    mode_by_sym = {r["symbol"]: r.get("mode", "live") for r in load_positions()}
+    mode_by_sym = {r["symbol"]: r.get("mode", "paper") for r in load_positions()}
     for r in diag["results"]:
         r.setdefault("name", names.get(r["symbol"], ""))
-        r["mode"] = mode_by_sym.get(r["symbol"], "live")
-    hist = [r for r in load_positions() if r["status"] == "closed"]
+        r["mode"] = mode_by_sym.get(r["symbol"], "paper")
+    # 存量记录无 mode 字段，默认视为模拟（与升级前实际使用方式一致）
+    hist = [{**r, "mode": r.get("mode", "paper")}
+            for r in load_positions() if r["status"] == "closed"]
     return jsonify({"diagnosis": diag, "history": hist[-50:],
                     "exit_rules": {k: {kk: vv for kk, vv in v.items()}
                                    for k, v in EXIT_RULES.items()}})
@@ -939,6 +941,17 @@ def api_review_report():
     except ValueError:
         days = 30
     return jsonify(review_report(days))
+
+
+@app.route("/api/paper_trades")
+def api_paper_trades():
+    """模拟盘 P&L 曲线：返回权益曲线、总收益、最大回撤、交易明细。"""
+    from sps.positions import simulate_paper_trades
+    try:
+        initial_capital = max(1000, float(request.args.get("initial_capital") or 100000))
+    except ValueError:
+        initial_capital = 100000
+    return jsonify(simulate_paper_trades(initial_capital=initial_capital))
 
 
 @app.route("/api/feedback", methods=["POST"])

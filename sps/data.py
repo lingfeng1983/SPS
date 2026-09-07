@@ -425,32 +425,89 @@ def get_daily(symbol: str, start: str = "20150101",
     return df
 
 
+def _cache_last_date(path: Path) -> pd.Timestamp | None:
+    """Read the last date from a parquet file without loading full data.
+    Uses pyarrow metadata when possible, falls back to reading index.
+    """
+    try:
+        import pyarrow.parquet as pq
+        parquet = pq.ParquetFile(path)
+        metadata = parquet.schema_arrow.metadata or {}
+        import json
+        pandas_meta = json.loads(metadata.get(b"pandas", b"{}").decode("utf-8"))
+        index_cols = [v for v in pandas_meta.get("index_columns", []) if isinstance(v, str)]
+        candidates = index_cols + ["date", "__index_level_0__"]
+        for field in candidates:
+            if field not in parquet.schema.names:
+                continue
+            col_idx = parquet.schema.names.index(field)
+            maxima = []
+            for grp_idx in range(parquet.metadata.num_row_groups):
+                stats = parquet.metadata.row_group(grp_idx).column(col_idx).statistics
+                if stats is not None and stats.has_min_max:
+                    maxima.append(stats.max)
+            if maxima:
+                return pd.Timestamp(max(maxima))
+    except Exception:
+        pass
+    # Fallback: read the file
+    try:
+        df = pd.read_parquet(path, columns=[])
+        if len(df) > 0:
+            return pd.Timestamp(df.index[-1])
+    except Exception:
+        pass
+    return None
+
+
 def batch_get_daily(symbols: list[str], start: str = "20150101",
                     end: str | None = None, max_workers: int = 5,
                     on_progress=None, refresh: bool = False) -> dict[str, pd.DataFrame]:
-    """Load cache, or refresh it incrementally via HiThink then AkShare."""
+    """Load cache, or refresh it incrementally via HiThink then AkShare.
+
+    Incremental logic:
+    - If cache exists and last date is today/yesterday → skip entirely
+    - If cache exists but stale → fetch only from last_date+1 to today
+    - If no cache → full fetch from start date
+    """
     global LAST_BATCH_STATS
     _ensure_dirs()
     results: dict[str, pd.DataFrame] = {}
     cached: dict[str, pd.DataFrame] = {}
     need_fetch = []
-
     cache_tag = f"{start}_{end or 'latest'}"
+    today = pd.Timestamp.today().normalize()
     for sym in symbols:
         cache_file = DAILY_DIR / f"{sym.replace('.', '_')}_{cache_tag}.parquet"
         akshare_cache = DAILY_DIR / f"{sym.replace('.', '_')}_{cache_tag}_akshare.parquet"
+        path = None
         if cache_file.exists():
-            cached[sym] = pd.read_parquet(cache_file)
+            path = cache_file
         elif akshare_cache.exists():
-            cached[sym] = pd.read_parquet(akshare_cache)
-        if refresh or sym not in cached:
-            need_fetch.append(sym)
+            path = akshare_cache
+        if path is not None:
+            # Check if cache is up-to-date
+            last_dt = _cache_last_date(path)
+            if last_dt is not None and not refresh:
+                age_days = (today - last_dt.normalize()).days
+                if age_days <= 1:
+                    # Cache is fresh (today or yesterday) → skip
+                    cached[sym] = pd.read_parquet(path)
+                    results[sym] = cached[sym]
+                    continue
+                else:
+                    # Cache is stale → will fetch incrementally
+                    need_fetch.append(sym)
+            else:
+                need_fetch.append(sym)
         else:
-            results[sym] = cached[sym]
-
+            need_fetch.append(sym)
     if not need_fetch:
+        n_cached = len(results)
+        if n_cached > 0:
+            print(f"  {n_cached} 只股票缓存已是最新，无需下载")
         LAST_BATCH_STATS = {"requested": len(symbols), "hithink_refreshed": 0,
-                            "akshare_fallback": 0, "stale_cache_retained": 0,
+                            "akshare_fallback": 0, "stale_cache_retained": n_cached,
                             "qfq_refetched": 0, "snapshot_appended": 0,
                             "stale_sidecars_removed": 0}
         return results

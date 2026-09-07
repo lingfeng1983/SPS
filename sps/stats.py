@@ -8,6 +8,20 @@ import numpy as np
 import pandas as pd
 
 
+def bootstrap_ci(values, n_boot=2000, confidence=0.95):
+    """Bootstrap confidence interval using percentile method.
+    Returns (lower, upper) tuple.
+    """
+    arr = np.array(values)
+    n = len(arr)
+    boot_means = np.array([np.random.choice(arr, size=n, replace=True).mean()
+                           for _ in range(n_boot)])
+    alpha = (1 - confidence) / 2
+    lower = np.percentile(boot_means, alpha * 100)
+    upper = np.percentile(boot_means, (1 - alpha) * 100)
+    return lower, upper
+
+
 def entry_price(df: pd.DataFrame, signal_pos: int, max_defer: int = 5):
     """信号日后首个可成交日开盘价。返回 (entry_price, entry_pos) 或 (None, None)。
     可成交 = 非停牌且有成交；一字涨停(开=收=高=低 且涨幅>9.8%)视为不可成交简化处理。
@@ -93,11 +107,17 @@ def aggregate(rows: list[dict], horizons=(5, 10, 20, 60)) -> pd.DataFrame:
         arr = np.array(rs)
         wins = arr[arr > 0]
         losses = arr[arr <= 0]
+        wr = float((arr > 0).mean())
+        mr = float(arr.mean())
+        wr_lo, wr_hi = bootstrap_ci((arr > 0).astype(float))
+        mr_lo, mr_hi = bootstrap_ci(arr)
         recs.append({
             "horizon": f"{h}d",
             "n": len(arr),
-            "win_rate": round(float((arr > 0).mean()), 4),
-            "mean_ret": round(float(arr.mean()), 4),
+            "win_rate": round(wr, 4),
+            "win_rate_ci": f"{wr_lo:.2f}~{wr_hi:.2f}",
+            "mean_ret": round(mr, 4),
+            "mean_ret_ci": f"{mr_lo:.4f}~{mr_hi:.4f}",
             "median_ret": round(float(np.median(arr)), 4),
             "p25": round(float(np.percentile(arr, 25)), 4),
             "p75": round(float(np.percentile(arr, 75)), 4),
