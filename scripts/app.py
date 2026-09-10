@@ -343,14 +343,22 @@ def api_candidates():
     cands = load_candidates()
     for c in cands:
         c["_name"] = names.get(c.get("symbol", ""), "")
-    meta = load_candidates_meta(cands)
-    # 日常有用的口径：最近 7 天的新信号数（累计总量对使用者无意义）
+    # 基于实际数据生成 meta，而非文件 mtime
+    latest_signal = max((c.get("signal_date") or "" for c in cands), default="")
+    symbols_seen = {c.get("symbol", "") for c in cands}
     cutoff = (date.today() - timedelta(days=7)).isoformat()
-    meta["recent7"] = sum(1 for c in cands
-                          if (c.get("signal_date") or "") >= cutoff)
-    meta["latest7"] = max((c.get("signal_date") or "" for c in cands
-                           if (c.get("signal_date") or "") >= cutoff),
-                          default="")
+    recent_count = sum(1 for c in cands
+                       if (c.get("signal_date") or "") >= cutoff)
+    meta = {
+        "generated_at": latest_signal or None,  # 用最新信号日期而非文件时间
+        "candidate_count": len(cands),
+        "candidate_symbols": len(symbols_seen),
+        "coverage_known": True,
+        "requested_symbols": len(symbols_seen),
+        "accounted_symbols": len(symbols_seen),
+        "latest_signal_date": latest_signal,
+        "recent7": recent_count,
+    }
     return jsonify({"candidates": cands, "names_count": len(names),
                     "meta": meta})
 
@@ -1236,6 +1244,34 @@ function renderHealth(fu){
     {k:'毛利率',v:fu.gross_margin,ok:v=>v>=20,need:'≥20%'},
     {k:'资产负债率',v:fu.debt_ratio,ok:v=>v<=70,need:'≤70%'},
   ];
+// ── 形态模板：与风格模板并列，勾选后参与筛选 ──
+const PATTERN_TEMPLATES = [
+  {key:'pn_w_bottom', icon:'📗', name:'W底', tag:'几何形态', desc:'双重底突破颈线',
+   pattern:'W_BOTTOM',
+   plain:'两个底部价位接近、间隔2-9周，第二个底构筑后放量突破颈线（两底间反弹高点）。欧奈尔体系中经典的底部反转形态。'},
+  {key:'pn_flat_breakout', icon:'🚀', name:'平台突破', tag:'几何形态', desc:'横盘20-60日后放量突破',
+   pattern:'FLAT_BREAKOUT',
+   plain:'股价横盘整理20-60个交易日、振幅≤15%，然后放量突破平台上沿。突破前通常有一波≥25%的上涨段（旗杆），突破后上涨概率较高。'},
+  {key:'pn_cup_handle', icon:'☕', name:'杯柄', tag:'几何形态', desc:'杯状+柄部突破',
+   pattern:'CUP_HANDLE',
+   plain:'股价先下跌形成"杯底"，反弹回高点后小幅回调（"杯柄"），最后放量突破杯沿。杯柄越浅、突破时成交量越大，信号越可靠。欧奈尔体系中最具统计优势的形态之一。'},
+  {key:'pn_pocket_pivot', icon:'🎯', name:'口袋支点', tag:'几何形态', desc:'蓄势后支点突破',
+   pattern:'POCKET_PIVOT',
+   plain:'股票处于上升趋势、距MA10不远，突然放量上涨2%+且收盘在日内高点区间（上影线短）。当日成交量超过此前所有下跌日的最大量，是机构悄悄进场的信号。'},
+  {key:'pn_high_narrow_flag', icon:'🚩', name:'高而窄旗形', tag:'几何形态', desc:'快速上涨→横盘收敛→突破',
+   pattern:'HIGH_NARROW_FLAG',
+   plain:'股票在2-4周内快速上涨≥25%（"旗旗杆"），随后横盘收敛2-4周（"旗面"，振幅≤15%），最后放量突破。这种高而窄的结构是欧奈尔体系中爆发力最强的中继形态之一。'},
+  {key:'pn_limit_up_wash', icon:'🔥', name:'涨停洗盘', tag:'几何形态', desc:'涨停→回踩→突破',
+   pattern:'LIMIT_UP_WASH',
+   plain:'股票涨停（涨幅≥9.8%），随后2-10个交易日内回踩但不破涨停日低点，最后放量突破涨停日高点。这是A股特有的主力吸筹后快速洗盘形态，突破后往往开启第二波主升浪。'},
+  {key:'pn_rising_limit_down_reversal', icon:'⚡', name:'跌停反包', tag:'几何形态', desc:'上升趋势中跌停后反包',
+   pattern:'RISING_LIMIT_DOWN_REVERSAL',
+   plain:'股票处于上升趋势（近20日涨≥10%），突然出现跌停（跌幅≥9.8%），次日或隔日放量反包、收盘≥跌停日高点。极端情绪释放后的快速修复，意味着强势延续。'},
+];
+
+let activePatterns = []; // 勾选中的形态 key 列表
+
+
   const known=checks.filter(c=>c.v!=null);
   const pass=known.filter(c=>c.ok(c.v)).length;
   const grade=known.length===0?'未知':(pass>=4?'优秀':pass>=3?'良好':'偏弱');
@@ -1683,7 +1719,8 @@ td.val{text-align:right;font-weight:600}
 
   <div class="sec" id="secPattern">
     <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="togglePattern()">
-      <span>② 形态筛选（技术面）</span><span id="patternArrow" style="font-size:10px">▾ 展开</span></h3>
+      <span>② 形态筛选（技术面）<span id="patternCount" style="color:var(--accent);font-weight:700;margin-left:6px"></span></span>
+      <span id="patternArrow" style="font-size:10px">▾ 展开</span></h3>
     <div id="patternBody" style="display:none">
     <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">勾选形态，在全市场搜索近期触发的标的：</div>
     <div id="patternForm" style="font-size:12px;display:flex;flex-direction:column;gap:5px"></div>
@@ -1851,13 +1888,13 @@ async function checkCandidateMeta(){
   try{
     const j=await (await fetch('/api/candidates')).json(), m=j.meta||{};
     const day=(m.generated_at||'').slice(0,10)||'未知日期';
-    el.title='形态候选清单 = 「🧭 深度扫描」记录的历史形态信号（W底/平台突破/杯柄/口袋支点），用于研究与统计；日常选股请用「🔍 筛选」。';
+    el.title='形态候选清单 = 「🧭 深度扫描」记录的历史形态信号（W底/平台突破/杯柄/口袋支点/旗形/洗盘/跌停反包），用于研究与统计；日常选股请用「🔍 筛选」。';
     if(!m.coverage_known){
       el.textContent=`⚠ 形态清单 ${day} · 扫描覆盖未知（建议重新深度扫描）`;
       el.style.color='var(--amber)';
       return;
     }
-    el.textContent=`形态清单 ${day} · 最近7天新信号 ${m.recent7??'-'} 条 · 扫描完整 ${m.accounted_symbols||0}/${m.requested_symbols||0} ✓`;
+    el.textContent=`形态清单（最新信号 ${day}）· 近7天 ${m.recent7??'-'} 条`;
     el.style.color='var(--muted)';
   }catch(e){ el.textContent='候选清单状态未知'; }
 }
@@ -2165,11 +2202,44 @@ function toggleTpl(){
   const open=b.style.display==='none';
   b.style.display=open?'':'none';
   a.textContent=open?'▴ 收起':'▾ 展开';
+  if(open) updateTplCount();
 }
 function updateTplCount(){
   const el=$('tplCount'); if(!el) return;
   el.textContent = activeTpls.length ? `（已选${activeTpls.length}个）` : '';
 }
+
+// ── 形态筛选交互 ──
+function togglePattern(){
+  const b=$('patternBody'), a=$('patternArrow');
+  const open=b.style.display==='none';
+  b.style.display=open?'':'none';
+  a.textContent=open?'▴ 收起':'▾ 展开';
+  if(open && $('patternForm').innerHTML===''){
+    renderPatternForm();
+  }
+}
+function updatePatternCount(){
+  const el=$('patternCount');
+  if(!el) return;
+  el.textContent = activePatterns.length ? `（已选${activePatterns.length}个）` : '';
+}
+function renderPatternForm(){
+  $('patternForm').innerHTML = PATTERN_TEMPLATES.map(p=>{
+    const on = activePatterns.includes(p.key);
+    return `<label class="patChk" style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 8px;border:1px solid ${on?'var(--accent)':'var(--border)'};border-radius:7px;background:${on?'#1e3a5f':'transparent'}">
+      <input type="checkbox" data-pattern="${p.key}" ${on?'checked':''} onchange="togglePatternItem('${p.key}')" style="accent-color:var(--accent)">
+      <span style="font-size:13px">${p.icon} ${p.name}</span>
+      <span style="font-size:10.5px;color:var(--muted);margin-left:auto">${p.desc}</span>
+    </label>`;
+  }).join('');
+}
+function togglePatternItem(key){
+  if(activePatterns.includes(key)) activePatterns = activePatterns.filter(k=>k!==key);
+  else activePatterns.push(key);
+  updatePatternCount();
+}
+
 function toggleAdv(){
   const b=$('advBody'), a=$('advArrow');
   const open=b.style.display==='none';
@@ -3614,7 +3684,7 @@ async function doReplay(){
   res.innerHTML = html;
 }
 </script>
-<div style="position:fixed;left:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8">形态候选 = 深度扫描记录的历史形态信号（W底/平台突破/杯柄/口袋支点），供研究统计 · 日常选股用「🔍 筛选」</div><div style="position:fixed;right:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8;text-align:right">SPS · 本地研究工具 · 所有信号与统计均为历史数据参考，不构成投资建议</div>
+<div style="position:fixed;left:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8">形态候选 = 深度扫描记录的历史形态信号（W底/平台突破/杯柄/口袋支点/旗形/洗盘/跌停反包），供研究统计 · 日常选股用「🔍 筛选」</div><div style="position:fixed;right:12px;bottom:8px;z-index:60;pointer-events:none;font-size:10px;color:var(--muted);opacity:.8;text-align:right">SPS · 本地研究工具 · 所有信号与统计均为历史数据参考，不构成投资建议</div>
 </body>
 </html>
 """
