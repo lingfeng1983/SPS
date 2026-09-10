@@ -365,6 +365,113 @@ def api_indicators():
 
 # ---------------- 策略保存 / 参数回测成绩 ----------------
 
+@app.route("/api/pattern_screen", methods=["POST"])
+def api_pattern_screen():
+    """形态筛选：只运行形态检测器，不跑参数筛选。"""
+    global _pattern_task
+    body = request.get_json(force=True) or {}
+    patterns = body.get("patterns", [])
+    if not patterns:
+        return jsonify({"error": "未选择任何形态"}), 400
+    stop_pct = float(body.get("stop_pct", 7.0))
+    
+    from sps.patterns import ALL_DETECTORS
+    selected = [d for d in ALL_DETECTORS if d.name in patterns]
+    if not selected:
+        return jsonify({"error": "无效的形态选择"}), 400
+    
+    def worker():
+        global _pattern_task
+        import pandas as pd
+        try:
+            from sps.data import get_all_symbols, DATA_DIR
+            uni = get_all_symbols(include_etf=False, exclude_st_bj=True)
+            syms = uni["symbol"].tolist()
+            results = {"triggered": [], "near": [], "upgraded": [], "scanned": 0}
+            
+            for i, sym in enumerate(syms):
+                if _pattern_task.get("cancel"):
+                    break
+                try:
+                    df = None
+                    for f in DATA_DIR.glob(f"daily/{sym}_*.parquet"):
+                        try:
+                            raw = pd.read_parquet(f)
+                            if isinstance(raw.index, pd.DatetimeIndex):
+                                df = raw
+                            elif "date" in raw.columns:
+                                df = raw.set_index(pd.to_datetime(raw["date"]))
+                            if df is not None and {"O", "H", "L", "C", "V"} <= set(df.columns):
+                                break
+                            df = None
+                        except Exception:
+                            continue
+                    if df is None or len(df) < 60:
+                        continue
+                    
+                    results["scanned"] += 1
+                    for det_cls in selected:
+                        det = det_cls()
+                        try:
+                            evs = det.scan(df, symbol=sym)
+                            for e in evs:
+                                d = e.to_dict()
+                                d["_name"] = sym
+                                if d.get("status") == "confirmed":
+                                    results["triggered"].append(d)
+                                elif d.get("status") == "near":
+                                    results["near"].append(d)
+                        except Exception:
+                            continue
+                    
+                    if (i + 1) % 100 == 0:
+                        _pattern_task["progress"] = {
+                            "phase": "形态检测中",
+                            "pct": round((i + 1) / len(syms) * 100)
+                        }
+                except Exception:
+                    continue
+            
+            _pattern_task["result"] = results
+            _pattern_task["done"] = True
+        except Exception as e:
+            _pattern_task["error"] = str(e)
+            _pattern_task["done"] = True
+    
+    import threading
+    if _pattern_task["active"]:
+        return jsonify({"error": "已有任务在运行中"}), 409
+    
+    _pattern_task["active"] = True
+    _pattern_task["done"] = False
+    _pattern_task["cancel"] = False
+    _pattern_task["progress"] = {"phase": "准备中", "pct": 0}
+    _pattern_task["result"] = None
+    _pattern_task["error"] = None
+    
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+_pattern_task = {"active": False, "done": False, "progress": {"phase": "准备中", "pct": 0}, "result": None, "error": None, "cancel": False}
+
+
+@app.route("/api/pattern_screen_status")
+def api_pattern_screen_status():
+    return jsonify({
+        "active": _pattern_task["active"],
+        "done": _pattern_task["done"],
+        "progress": _pattern_task["progress"],
+        "error": _pattern_task["error"]})
+
+
+@app.route("/api/pattern_screen_result")
+def api_pattern_screen_result():
+    if _pattern_task["result"] is None:
+        return jsonify({"error": "无结果"}), 404
+    return jsonify(_pattern_task["result"])
+
+
 @app.route("/api/strategies", methods=["GET"])
 def api_strategies():
     from sps.strategies import list_strategies
@@ -1574,6 +1681,20 @@ td.val{text-align:right;font-weight:600}
     </div>
   </div>
 
+  <div class="sec" id="secPattern">
+    <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="togglePattern()">
+      <span>② 形态筛选（技术面）</span><span id="patternArrow" style="font-size:10px">▾ 展开</span></h3>
+    <div id="patternBody" style="display:none">
+    <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">勾选形态，在全市场搜索近期触发的标的：</div>
+    <div id="patternForm" style="font-size:12px;display:flex;flex-direction:column;gap:5px"></div>
+    <div class="row" style="margin-top:8px">🛡 止损%
+      <input id="stopPctPattern" type="number" value="7" step="0.5" min="1" max="20" aria-label="止损百分比" style="width:60px">
+      <span style="font-size:10.5px;color:var(--muted)">风控参数</span></div>
+    <button class="green" style="margin-top:4px" onclick="doPatternScreen()">🔍 开始形态筛选</button>
+    <div id="patternResultInfo" style="font-size:11.5px;color:var(--muted);margin-top:4px"></div>
+    </div>
+  </div>
+
   <div class="sec" id="secScreen">
     <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="toggleAdv()">
       <span>② 自定义指标（进阶）</span><span id="advArrow" style="font-size:10px">▾ 展开</span></h3>
@@ -2055,8 +2176,92 @@ function toggleAdv(){
   b.style.display=open?'':'none';
   a.textContent=open?'▴ 收起':'▾ 展开';
 }
+function togglePattern(){
+  const b=$('patternBody'), a=$('patternArrow');
+  const open=b.style.display==='none';
+  b.style.display=open?'':'none';
+  a.textContent=open?'▴ 收起':'▾ 展开';
+  if(open && $('patternForm').innerHTML===''){
+    renderPatternForm();
+  }
+}
 
-// ================= 行业分布条形图（可视化，可点击筛选） =================
+// ================= 形态筛选 =================
+const PATTERNS = [
+  {key:'W_BOTTOM', name:'W底', icon:'📗', desc:'双重底突破颈线'},
+  {key:'FLAT_BREAKOUT', name:'平台突破', icon:'🚀', desc:'横盘后放量突破'},
+  {key:'CUP_HANDLE', name:'杯柄', icon:'☕', desc:'杯状+柄部突破'},
+  {key:'POCKET_PIVOT', name:'口袋支点', icon:'🎯', desc:'蓄势后支点突破'},
+  {key:'HIGH_NARROW_FLAG', name:'高而窄旗形', icon:'🚩', desc:'快速上涨→横盘收敛→突破'},
+  {key:'LIMIT_UP_WASH', name:'涨停洗盘', icon:'🔥', desc:'涨停→回踩→突破'},
+  {key:'RISING_LIMIT_DOWN_REVERSAL', name:'跌停反包', icon:'⚡', desc:'上升趋势中跌停后反包'},
+];
+let activePatterns = [];
+
+function renderPatternForm(){
+  $('patternForm').innerHTML = PATTERNS.map(p=>{
+    const on = activePatterns.includes(p.key);
+    return `<label class="patChk" style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 8px;border:1px solid ${on?'var(--accent)':'var(--border)'};border-radius:7px;background:${on?'#1e3a5f':'transparent'}">
+      <input type="checkbox" data-pattern="${p.key}" ${on?'checked':''} onchange="togglePatternItem('${p.key}')" style="accent-color:var(--accent)">
+      <span style="font-size:13px;font-size:13px">${p.icon} ${p.name}</span>
+      <span style="font-size:10.5px;color:var(--muted);margin-left:auto">${p.desc}</span>
+    </label>`;
+  }).join('');
+}
+function togglePatternItem(key){
+  if(activePatterns.includes(key)) activePatterns = activePatterns.filter(k=>k!==key);
+  else activePatterns.push(key);
+}
+async function doPatternScreen(){
+  if(!activePatterns.length){ alert('请至少勾选一个形态'); return; }
+  const listEl=document.getElementById('list');
+  const prog=`<div id="screenProg" style="padding:30px;text-align:center">
+    <div style="color:var(--muted);margin-bottom:12px" id="screenProgText">形态检测中，全市场扫描...</div>
+    <div style="width:240px;height:8px;background:#1e293b;border-radius:4px;margin:0 auto;overflow:hidden">
+      <div id="screenProgBar" style="height:100%;width:5%;background:linear-gradient(90deg,#3b82f6,#60a5fa);border-radius:4px;transition:width 0.3s"></div>
+    </div>
+    <div id="screenProgPct" style="font-size:11px;margin-top:6px;color:var(--muted)"></div>
+  </div>`;
+  listEl.innerHTML=prog;
+  try{
+    const r=await fetch('/api/pattern_screen',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({patterns:activePatterns,stop_pct:parseFloat(document.getElementById('stopPctPattern').value)||7})});
+    if(r.status===409){ alert('已有任务在运行中'); return; }
+    if(!r.ok){ const e=await r.json().catch(()=>({})); listEl.innerHTML=`<div style="color:var(--red);padding:20px">${e.error||'筛选失败'}</div>`; return; }
+  }catch(e){
+    listEl.innerHTML=`<div style="color:var(--red);padding:20px">启动失败：${e.message}</div>`;
+    return;
+  }
+  await pollPatternScreenProgress();
+}
+function pollPatternScreenProgress(){
+  return new Promise((resolve,reject)=>{
+    const poll=setInterval(async()=>{
+      try{
+        const s=await(await fetch('/api/pattern_screen_status')).json();
+        if(s.error){clearInterval(poll);reject(new Error(s.error));return;}
+        const p=s.progress;
+        if(p){
+          const bar=document.getElementById('screenProgBar');
+          const txt=document.getElementById('screenProgText');
+          const pct=document.getElementById('screenProgPct');
+          if(bar)bar.style.width=p.pct+'%';
+          if(txt)txt.textContent=p.phase;
+          if(pct)pct.textContent=p.pct+'%';
+        }
+        if(s.done){
+          clearInterval(poll);
+          const r=await fetch('/api/pattern_screen_result');
+          if(!r.ok){reject(new Error('获取结果失败'));return;}
+          SCREEN_RESULT=await r.json();
+          renderScreenResult();
+          resolve();
+        }
+      }catch(e){clearInterval(poll);reject(e);}
+    },500);
+  });
+}
 let indFilter = null;   // 当前点击选中的行业
 function industryBars(summary){
   const items=(summary||[]).slice(0,30);
