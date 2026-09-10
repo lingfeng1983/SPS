@@ -229,12 +229,12 @@ def get_batch_hithink(symbols: list[str], start: str | None = None,
 # ================================================================ 快照快路径（每日增量）
 
 def _trade_calendar() -> list[str]:
-    """A股交易日历（HiThink market calendar），本地缓存 7 天。返回 ['YYYYMMDD', ...]。"""
+    """A股交易日历（HiThink market calendar），本地缓存 1 天。返回 ['YYYYMMDD', ...]。"""
     f = META_DIR / "trade_calendar.json"
     if f.exists():
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
-            if d.get("dates") and time.time() - d.get("_ts", 0) < 7 * 86400:
+            if d.get("dates") and time.time() - d.get("_ts", 0) < 1 * 86400:  # 1天缓存
                 return d["dates"]
         except Exception:
             pass
